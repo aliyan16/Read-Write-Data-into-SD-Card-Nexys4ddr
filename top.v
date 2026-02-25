@@ -5,7 +5,7 @@
 // USER INTERFACE:
 //   SW[0]     = Mode:  1=WRITE,  0=READ
 //   SW[4:1]   = 4-bit digit to write  (0-9, use BCD)
-//   SW[15:5]  = 11-bit SD block address (blocks 0-2047, avoid block 0=MBR)
+//   SW[15:5]  = 11-bit address into DATA.BIN (blocks 0-2047, each block = 512 bytes)
 //   BTNC      = Trigger: perform read or write operation
 //   BTND      = Reset
 //
@@ -64,7 +64,9 @@ wire [4:0] debug_last;
 
 reg        rd_start  = 0;
 reg        wr_start  = 0;
-wire [31:0] addr     = {21'b0, SW15_5}; // SD block address from SW[15:5]
+// FAT16 DATA.BIN starts at sector 20 (after boot+FAT+rootdir).
+// SW15_5 selects which 512-byte block inside DATA.BIN to access.
+wire [31:0] addr     = 32'd20 + {21'b0, SW15_5};
 reg [7:0]  wr_byte   = 8'h00;
 
 // Stored digit (last read from SD)

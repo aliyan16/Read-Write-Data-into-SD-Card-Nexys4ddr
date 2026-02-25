@@ -1,0 +1,35 @@
+Raw Sector Write — No File System
+The code writes directly to raw SD card blocks using SPI mode. There is no FAT, no file system, no files at all.
+
+How it writes
+In sd_spi.v, the write uses CMD24 (WRITE_SINGLE_BLOCK):
+
+
+cmd_buf[0] = 0x58   ← CMD24 opcode
+cmd_buf[1..4]       ← 32-bit block address (from your switches)
+The sequence is:
+
+Send CMD24 with the block address
+Send data start token 0xFE
+Send 512 bytes of data — but only the first byte is your digit (0x30–0x39 ASCII), the remaining 511 bytes are all the same byte repeated (it sends wr_data for all 512 iterations in ST_WR_DATA)
+Send 2 dummy CRC bytes (0xFF 0xFF)
+What actually gets stored
+
+wr_byte <= {4'h3, SW4_1};   // e.g. digit 5 → 0x35 (ASCII '5')
+If you write digit 5 at block 1, the SD card's block 1 (bytes 512–1023) becomes:
+
+
+35 35 35 35 35 35 35 35 ...  (512 bytes, all 0x35)
+How it reads back
+Uses CMD17 (READ_SINGLE_BLOCK) at the same block address. It reads all 512 bytes but only captures the very first byte (first_byte), extracts the lower nibble (first_byte[3:0]), and shows it on the 7-segment display.
+
+Summary
+Property	Value
+Protocol	SPI Mode (not SDIO)
+Write command	CMD24 — single block write
+Read command	CMD17 — single block read
+Data format	Raw binary, no FAT, no filesystem
+Block size	512 bytes per operation
+Useful data stored	1 byte (your digit), rest are duplicates
+Address unit	Block number (1 block = 512 bytes)
+This means if you put this SD card into a PC, the PC won't see any files — it will either show the card as unformatted or show whatever partition/filesystem was there before (your writes just corrupt a few raw blocks directly).
