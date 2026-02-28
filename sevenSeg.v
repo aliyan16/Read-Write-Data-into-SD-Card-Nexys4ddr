@@ -37,6 +37,12 @@ function [6:0] seg_decode;
         4'd7: seg_decode = 7'b1111000;
         4'd8: seg_decode = 7'b0000000;
         4'd9: seg_decode = 7'b0010000;
+        4'd10: seg_decode = 7'b0001000; // A
+        4'd11: seg_decode = 7'b0000011; // b
+        4'd12: seg_decode = 7'b1000110; // C
+        4'd13: seg_decode = 7'b0100001; // d
+        4'd14: seg_decode = 7'b0000110; // E
+        4'd15: seg_decode = 7'b0001110; // F
         default: seg_decode = 7'b0111111; // dash
     endcase
 endfunction

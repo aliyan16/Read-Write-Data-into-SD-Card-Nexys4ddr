@@ -30,6 +30,7 @@ module sd_spi_controller (
     input  wire        wr_start,
     input  wire [31:0] wr_addr,
     input  wire [7:0]  wr_data,
+    output wire [8:0]  wr_byte_idx,
     output reg         wr_done,
 
     output reg         busy,
@@ -142,6 +143,7 @@ reg [31:0] delay_cnt  = 0;
 reg [2:0]  cmd_idx    = 0;
 reg [7:0]  cmd_buf    [0:5];
 reg [9:0]  byte_cnt   = 0;
+assign wr_byte_idx = byte_cnt[8:0];
 reg [15:0] retry      = 0;
 reg [15:0] poll_cnt   = 0;
 reg        token_sent = 0;
