@@ -1,0 +1,27 @@
+ FAT (File Allocation Table) — What It Is & Its Purpose in Your Project                                                                                                                                                                                                                                                        
+  What is FAT?                                                                                                                                                                                                                                                                                                                  
+  FAT (File Allocation Table) is a simple filesystem format originally designed by Microsoft. It organizes data on a storage device (like an SD card) so that     both computers and embedded devices can find and manage files. The "File Allocation Table" itself is a map that tracks which sectors on the disk belong to      which file, and in what order.                                                                                                                                                                                                                                                                                                  FAT16 Structure (as used in your project)                                                                                                                                                                                                                                                                                       Your format_sd.py creates a FAT16 volume on the SD card with this layout:                                                                                       ┌───────────┬──────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────┐                         │ Sector(s) │       Content        │                                             Purpose                                              │                         ├───────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤                         │ 0         │ Boot Sector (BPB)    │ Describes the volume — sector size, FAT count, root entry count, etc. Ends with signature 0x55AA │                         ├───────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤                       
+  │ 1–9       │ FAT Table (copy 1)   │ The allocation table — maps which clusters belong to DATA.BIN                                    │
+  ├───────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 10–18     │ FAT Table (copy 2)   │ Redundant copy for reliability                                                                   │
+  ├───────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 19        │ Root Directory       │ Contains the file entry for DATA.BIN (name, size, starting cluster)                              │
+  ├───────────┼──────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 20–2067   │ DATA.BIN (file data) │ The actual 1 MB file content (2048 × 512-byte blocks)                                            │
+  └───────────┴──────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────┘
+  Why does your project need FAT?
+
+  Your FPGA reads/writes raw sectors over SPI — it has no concept of files. FAT serves as the bridge between FPGA and PC:
+
+  1. PC compatibility — When you plug the SD card into a computer, Windows/Linux sees a proper FAT16 volume with a readable DATA.BIN file instead of raw        
+  unstructured bytes.
+  2. Organized layout — FAT metadata (boot sector, allocation tables, root directory) tells the OS where DATA.BIN lives. Your FPGA skips over this metadata by  
+  adding offset 20:
+  physical_sector = 20 + SW[15:5]
+  2. This ensures the FPGA only writes into the file's data area, never corrupting the filesystem structure.
+  3. Verification — Your verify_sd.py can read back both the FAT structure and the file content to confirm the FPGA wrote data correctly.
+
+  In short
+
+  FAT = a standardized table of contents for the SD card. It lets your FPGA write raw data to specific sectors while ensuring a PC can still read that data as a
+   normal file (DATA.BIN). Without it, the SD card would just contain unstructured bytes that no operating system could interpret.
