@@ -46,24 +46,32 @@ try:
             f"({'OK - 1 MB' if file_size == 1048576 else 'WRONG - should be 1048576'})"
         )
 
-        # DATA.BIN source + next two sectors
-        print(f"\n=== DATA.BIN content around SW15_5={BASE_BLOCK} ===")
-        captures = []
+        # Selected block full header view (single-sector flow verification)
+        f.seek((20 + BASE_BLOCK) * 512)
+        block = f.read(512)
+        plain = block[0:16]
+        enc = block[16:32]
+        dec = block[32:48]
+
+        print(f"\n=== DATA.BIN selected block SW15_5={BASE_BLOCK} ===")
+        print("  Plain [0..15] : " + " ".join(f"{b:02X}" for b in plain))
+        print("  Enc   [16..31]: " + " ".join(f"{b:02X}" for b in enc))
+        print("  Dec   [32..47]: " + " ".join(f"{b:02X}" for b in dec))
+
+        same = plain == dec
+        print("\n=== Single-Sector Check ===")
+        print(
+            "  Plain[0..15] vs Dec[32..47]: "
+            + ("MATCH (decrypt OK)" if same else "DIFFER (decrypt not matching yet)")
+        )
+
+        # Legacy view for older bitstreams (encrypt/decrypt in next sectors).
+        print("\n=== Legacy Cross-Sector View (old flow) ===")
         for blk in (BASE_BLOCK, min(BASE_BLOCK + 1, 2047), min(BASE_BLOCK + 2, 2047)):
             f.seek((20 + blk) * 512)
             data = f.read(16)
-            captures.append((blk, data))
             hex_str = " ".join(f"{b:02X}" for b in data)
-            asc_str = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
-            print(f"  Block {blk} (SW15_5={blk}): {hex_str}  |{asc_str}|")
-
-        if captures[0][0] != captures[2][0]:
-            same = captures[0][1] == captures[2][1]
-            print("\n=== Quick AES Check ===")
-            print(
-                f"  Block {captures[0][0]} vs Block {captures[2][0]} first 16 bytes: "
-                f"{'MATCH (decrypt OK)' if same else 'DIFFER (decrypt not matching yet)'}"
-            )
+            print(f"  Block {blk} first 16 bytes: {hex_str}")
 
         print("\nDone.")
 

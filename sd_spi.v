@@ -557,14 +557,20 @@ always @(posedge clk) begin
 
         ST_WR_DATA: begin
             if (!spi_busy && !spi_req) begin
-                spi_tx  = wr_data;
-                spi_req <= 1;
+                // Important: advance byte counter only after the previous byte
+                // has fully completed, then start the next transfer on the
+                // following cycle. This avoids repeating byte 0 and shifting
+                // the whole 512-byte payload by one byte.
                 if (spi_done) begin
-                    byte_cnt <= byte_cnt + 1;
                     if (byte_cnt == 511) begin
                         byte_cnt <= 0;
                         state    <= ST_WR_CRC;
+                    end else begin
+                        byte_cnt <= byte_cnt + 1;
                     end
+                end else begin
+                    spi_tx  = wr_data;
+                    spi_req <= 1;
                 end
             end
         end
