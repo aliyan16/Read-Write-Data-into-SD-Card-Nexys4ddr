@@ -1,4 +1,4 @@
-"""
+r"""
 format_sd.py  --  Write a minimal FAT16 filesystem to an SD card.
 
 Creates one file: DATA.BIN (1 MB = 2048 x 512-byte blocks).
@@ -17,6 +17,7 @@ Usage:
   Windows (run as Administrator):
       python format_sd.py \\.\PhysicalDrive2
       python format_sd.py \\.\PhysicalDrive2 --force
+      python format_sd.py \\.\PhysicalDrive2 --force --erase-data
 
   Linux (run as root):
       sudo python format_sd.py /dev/sdb
@@ -111,7 +112,7 @@ def make_root_dir():
 
 
 # ── Write to device ───────────────────────────────────────────────────────────
-def write_fat16(device_path):
+def write_fat16(device_path, erase_data=False):
     boot  = make_boot_sector()
     fat   = make_fat()
     root  = make_root_dir()
@@ -123,6 +124,7 @@ def write_fat16(device_path):
     print(f"Root dir      : sector {DATA_START_SECTOR - 1}")
     print(f"DATA.BIN data : sectors {DATA_START_SECTOR}-{DATA_START_SECTOR + DATA_CLUSTERS - 1}")
     print(f"DATA.BIN size : {DATA_CLUSTERS * SECTOR_SIZE // 1024} KB  ({DATA_CLUSTERS} blocks x 512 bytes)")
+    print(f"Erase DATA.BIN : {'YES (write zeros to sectors 20-2067)' if erase_data else 'NO (keep existing data)'}")
     print(f"\nFPGA address mapping:")
     print(f"  SW[15:5] = 0    -> sector {DATA_START_SECTOR}  = DATA.BIN byte offset 0")
     print(f"  SW[15:5] = 1    -> sector {DATA_START_SECTOR+1}  = DATA.BIN byte offset 512")
@@ -146,10 +148,18 @@ def write_fat16(device_path):
             f.seek((RESERVED_SECTORS + NUM_FATS * FAT_SECTORS) * SECTOR_SIZE)
             f.write(root)
 
+            if erase_data:
+                f.seek(DATA_START_SECTOR * SECTOR_SIZE)
+                zero = b"\x00" * SECTOR_SIZE
+                for _ in range(DATA_CLUSTERS):
+                    f.write(zero)
+
             f.flush()
             os.fsync(f.fileno())
 
         print("\nDone! FAT16 structure written successfully.")
+        if erase_data:
+            print("DATA.BIN area was erased to all zeros.")
         print("Safely eject and reinsert the SD card.")
         print("DATA.BIN should appear as a 1 MB file on your PC.")
 
@@ -197,14 +207,18 @@ if __name__ == '__main__':
         sys.exit(0)
 
     device = sys.argv[1]
-    force  = '--force' in sys.argv
+    force = '--force' in sys.argv
+    erase_data = '--erase-data' in sys.argv
 
     print("=" * 60)
     print("  FAT16 SD Card Formatter for FPGA SD Reader")
     print("=" * 60)
     print(f"\nAbout to write FAT16 structure to: {device}")
     print("This will OVERWRITE the first 20 sectors (boot+FAT+rootdir).")
-    print("Existing DATA.BIN content (sectors 20+) is NOT erased.")
+    if erase_data:
+        print("DATA.BIN content (sectors 20+) WILL be erased to 0x00.")
+    else:
+        print("Existing DATA.BIN content (sectors 20+) is NOT erased.")
 
     if not force:
         answer = input("\nType YES to continue: ")
@@ -212,4 +226,4 @@ if __name__ == '__main__':
             print("Aborted.")
             sys.exit(0)
 
-    write_fat16(device)
+    write_fat16(device, erase_data=erase_data)
