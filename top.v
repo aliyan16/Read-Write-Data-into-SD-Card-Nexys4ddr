@@ -1,8 +1,8 @@
 // ============================================================
-// top.v -- Single-sector Plain/Encrypt/Decrypt flow
+// top.v -- Single-sector Image Plain/Encrypt/Decrypt flow
 //
 // FLOW:
-//   BTNC : write plain digit (from SW4_1) into selected sector
+//   BTNC : load plain image block into selected sector
 //   BTNU : encrypt current plain block, store in same selected sector
 //   BTNR : decrypt current encrypted block, store in same selected sector
 //   BTNL : clear selected sector payload
@@ -18,11 +18,11 @@ module top (
 
     // Switches
     input  wire        SW0,       // unused (kept for pin compatibility)
-    input  wire [3:0]  SW4_1,
-    input  wire [10:0] SW15_5,
+    input  wire [3:0]  SW4_1,     // unused in image flow (kept for pin compatibility)
+    input  wire [10:0] SW15_5,    // image block index + sector index
 
     // Buttons
-    input  wire        BTNC,      // write plain
+    input  wire        BTNC,      // load image + write plain
     input  wire        BTNU,      // encrypt
     input  wire        BTNR,      // decrypt
     input  wire        BTNL,      // clear
@@ -81,12 +81,19 @@ assign SD_CMD  = sd_mosi_w;
 assign SD_DAT3 = sd_cs_w;
 
 wire [31:0] input_addr  = 32'd20 + {21'b0, SW15_5};
-wire [7:0]  input_ascii = {4'h3, SW4_1};
 
 // ------------------------------------------------------------------
 // AES engine
 // ------------------------------------------------------------------
 localparam [127:0] AES_KEY = 128'h00112233445566778899AABBCCDDEEFF;
+localparam integer IMAGE_BLOCK_COUNT_I = 197;
+localparam [10:0]  IMAGE_BLOCK_COUNT   = 11'd197;
+
+reg [127:0] image_rom [0:IMAGE_BLOCK_COUNT_I-1];
+
+initial begin
+    $readmemh("image_input.hex", image_rom);
+end
 
 reg  [127:0] plain_block     = 128'd0;
 reg  [127:0] enc_block       = 128'd0;
@@ -158,6 +165,7 @@ wire [7:0] wr_byte =
 // ------------------------------------------------------------------
 reg [3:0] disp_digit = 4'd0;
 reg       show_digit = 1'b0;
+reg [2:0] disp_msg   = 3'd0;
 
 reg write_led = 1'b0;
 reg enc_led   = 1'b0;
@@ -167,6 +175,13 @@ reg clr_led   = 1'b0;
 reg [31:0] op_addr = 32'd20;
 
 reg [3:0] ctrl_state = 4'd0;
+localparam [2:0]
+    MSG_IDLE = 3'd0,
+    MSG_LOAD = 3'd1,
+    MSG_ENC  = 3'd2,
+    MSG_DEC  = 3'd3,
+    MSG_CLR  = 3'd4;
+
 localparam [3:0]
     CS_IDLE           = 4'd0,
     CS_WAIT_WR_PLAIN  = 4'd1,
@@ -200,6 +215,7 @@ always @(posedge CLK100MHZ) begin
         dec_input_block <= 128'd0;
         disp_digit      <= 4'd0;
         show_digit      <= 1'b0;
+        disp_msg        <= MSG_IDLE;
         write_led       <= 1'b0;
         enc_led         <= 1'b0;
         dec_led         <= 1'b0;
@@ -214,8 +230,12 @@ always @(posedge CLK100MHZ) begin
                         dec_led     <= 1'b0;
                         clr_led     <= 1'b0;
 
-                        // New plain write resets encrypted/decrypted fields.
-                        plain_block <= {120'd0, input_ascii};
+                        // Load one 16-byte image block selected by SW15_5.
+                        if (SW15_5 < IMAGE_BLOCK_COUNT) begin
+                            plain_block <= image_rom[SW15_5];
+                        end else begin
+                            plain_block <= 128'd0;
+                        end
                         enc_block   <= 128'd0;
                         dec_block   <= 128'd0;
 
@@ -265,6 +285,7 @@ always @(posedge CLK100MHZ) begin
                     write_led  <= 1'b1;
                     disp_digit <= plain_block[3:0];
                     show_digit <= 1'b1;
+                    disp_msg   <= MSG_LOAD;
                     ctrl_state <= CS_IDLE;
                 end
             end
@@ -296,6 +317,7 @@ always @(posedge CLK100MHZ) begin
                     enc_led    <= 1'b1;
                     disp_digit <= aes_enc_out[3:0];
                     show_digit <= 1'b1;
+                    disp_msg   <= MSG_ENC;
                     ctrl_state <= CS_IDLE;
                 end
             end
@@ -327,6 +349,7 @@ always @(posedge CLK100MHZ) begin
                     dec_led    <= 1'b1;
                     disp_digit <= aes_dec_out[3:0];
                     show_digit <= 1'b1;
+                    disp_msg   <= MSG_DEC;
                     ctrl_state <= CS_IDLE;
                 end
             end
@@ -342,6 +365,7 @@ always @(posedge CLK100MHZ) begin
                     clr_led    <= 1'b1;
                     disp_digit <= 4'd0;
                     show_digit <= 1'b1;
+                    disp_msg   <= MSG_CLR;
                     ctrl_state <= CS_IDLE;
                 end
             end
@@ -387,6 +411,7 @@ seven_seg seg_disp (
     .clk       (CLK100MHZ),
     .digit     (disp_digit),
     .show_digit(show_digit),
+    .status_msg(disp_msg),
     .init_ok   (init_done),
     .error_flag(init_err),
     .an        (AN),
@@ -409,6 +434,7 @@ assign LED[15]     = init_err;
 
 // Keep otherwise-unused ports tied to avoid warnings.
 wire _unused_sw0 = SW0;
+wire _unused_sw41 = ^SW4_1;
 wire _unused_cd  = SD_CD;
 wire _unused_btn_levels = btn_wr_level ^ btn_enc_level ^ btn_dec_level ^ btn_clr_level ^ btn_rst_pulse;
 wire _unused_rd = rd_valid ^ rd_done ^ rd_data[0];
