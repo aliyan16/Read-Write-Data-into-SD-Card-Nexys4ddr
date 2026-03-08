@@ -133,7 +133,8 @@ localparam [4:0]
     ST_WR_CRC      = 23,
     ST_WR_DRESP    = 24,
     ST_WR_BUSY     = 25,
-    ST_ERROR       = 26;
+    ST_ERROR       = 26,
+    ST_INIT_GAP    = 27;
 
 reg [4:0]  state      = ST_PWRUP;
 reg [4:0]  last_state = ST_PWRUP;   // captures state before ST_ERROR
@@ -147,6 +148,8 @@ assign wr_byte_idx = byte_cnt[8:0];
 reg [15:0] retry      = 0;
 reg [15:0] poll_cnt   = 0;
 reg        token_sent = 0;
+reg [4:0]  init_next_state = ST_CMD0;
+reg [3:0]  cmd0_retry = 0;
 
 // ------------------------------------------------------------------
 // Main FSM
@@ -162,7 +165,7 @@ always @(posedge clk) begin
 
     if (rst) begin
         state      <= ST_PWRUP;
-        sd_reset   <= 1;  // keep slot power OFF while resetting
+        sd_reset   <= 0;  // keep slot powered; rely on CMD0 for reset
         sd_cs      <= 1;
         init_done  <= 0;
         init_err   <= 0;
@@ -173,17 +176,18 @@ always @(posedge clk) begin
         retry      <= 0;
         poll_cnt   <= 0;
         token_sent <= 0;
+        init_next_state <= ST_CMD0;
+        cmd0_retry <= 0;
     end else begin
         case (state)
 
         // ── 1ms power-up hold ────────────────────────────────────
         ST_PWRUP: begin
             sd_cs    <= 1;
-            sd_reset <= 1; // power OFF
-            if (delay_cnt < 32'd100_000)
+            sd_reset <= 0;
+            if (delay_cnt < 32'd1_000_000)
                 delay_cnt <= delay_cnt + 1;
             else begin
-                sd_reset  <= 0;     // power card ON (active LOW)
                 delay_cnt <= 0;
                 state     <= ST_PWRDLY;
             end
@@ -192,12 +196,14 @@ always @(posedge clk) begin
         // ── 250ms stabilise after power-on ───────────────────────
         ST_PWRDLY: begin
             sd_cs <= 1;
-            if (delay_cnt < 32'd25_000_000)
+            sd_reset <= 0;
+            if (delay_cnt < 32'd50_000_000)
                 delay_cnt <= delay_cnt + 1;
             else begin
                 delay_cnt <= 0;
                 cmd_idx   <= 0;
                 poll_cnt  <= 0;
+                cmd0_retry <= 0;
                 state     <= ST_DUMMY;
             end
         end
@@ -205,7 +211,7 @@ always @(posedge clk) begin
         // ── 80 dummy clocks, CS high ─────────────────────────────
         ST_DUMMY: begin
             sd_cs <= 1;
-            if (delay_cnt < 10) begin
+            if (delay_cnt < 20) begin
                 if (!spi_busy && !spi_req) begin
                     spi_tx    = 8'hFF;
                     spi_req   <= 1;
@@ -219,6 +225,17 @@ always @(posedge clk) begin
                 cmd_buf[2] = 8'h00; cmd_buf[3] = 8'h00;
                 cmd_buf[4] = 8'h00; cmd_buf[5] = 8'h95;
                 state <= ST_CMD0;
+            end
+        end
+
+        ST_INIT_GAP: begin
+            sd_cs <= 1;
+            if (!spi_busy && !spi_req) begin
+                spi_tx  = 8'hFF;
+                spi_req <= 1;
+                if (spi_done) begin
+                    state <= init_next_state;
+                end
             end
         end
 
@@ -239,24 +256,45 @@ always @(posedge clk) begin
         end
 
         ST_CMD0_RESP: begin
+            sd_cs <= 0;
             if (!spi_busy && !spi_req) begin
                 spi_tx  = 8'hFF;
                 spi_req <= 1;
                 if (spi_done) begin
                     if (spi_rx_byte == 8'h01) begin
                         // R1=0x01 idle - good
-                        sd_cs      <= 1;
                         cmd_idx    <= 0;
                         poll_cnt   <= 0;
+                        cmd0_retry <= 0;
                         cmd_buf[0] = 8'h48; cmd_buf[1] = 8'h00;
                         cmd_buf[2] = 8'h00; cmd_buf[3] = 8'h01;
                         cmd_buf[4] = 8'hAA; cmd_buf[5] = 8'h87;
-                        state <= ST_CMD8;
+                        init_next_state <= ST_CMD8;
+                        state <= ST_INIT_GAP;
                     end else if (spi_rx_byte == 8'hFF) begin
                         poll_cnt <= poll_cnt + 1;
-                        if (poll_cnt >= 16'd50000) state <= ST_ERROR;
+                        if (poll_cnt >= 16'd60000) begin
+                            if (cmd0_retry >= 4'd7) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                cmd0_retry <= cmd0_retry + 1'b1;
+                                delay_cnt  <= 0;
+                                poll_cnt   <= 0;
+                                cmd_idx    <= 0;
+                                state      <= ST_DUMMY;
+                            end
+                        end
+                    end else begin
+                        if (cmd0_retry >= 4'd7) begin
+                            state <= ST_ERROR;
+                        end else begin
+                            cmd0_retry <= cmd0_retry + 1'b1;
+                            delay_cnt  <= 0;
+                            poll_cnt   <= 0;
+                            cmd_idx    <= 0;
+                            state      <= ST_DUMMY;
+                        end
                     end
-                    // other bytes: keep polling
                 end
             end
         end
@@ -279,20 +317,21 @@ always @(posedge clk) begin
 
         ST_CMD8_RESP: begin
             // Drain 6 bytes of R7 response - don't check content
+            sd_cs <= 0;
             if (!spi_busy && !spi_req) begin
                 spi_tx  = 8'hFF;
                 spi_req <= 1;
                 if (spi_done) begin
                     poll_cnt <= poll_cnt + 1;
                     if (poll_cnt >= 6) begin
-                        sd_cs      <= 1;
                         cmd_idx    <= 0;
                         poll_cnt   <= 0;
                         retry      <= 0;
                         cmd_buf[0] = 8'h77; cmd_buf[1] = 8'h00;
                         cmd_buf[2] = 8'h00; cmd_buf[3] = 8'h00;
                         cmd_buf[4] = 8'h00; cmd_buf[5] = 8'hFF;
-                        state <= ST_CMD55;
+                        init_next_state <= ST_CMD55;
+                        state <= ST_INIT_GAP;
                     end
                 end
             end
@@ -315,23 +354,24 @@ always @(posedge clk) begin
         end
 
         ST_CMD55_RESP: begin
+            sd_cs <= 0;
             if (!spi_busy && !spi_req) begin
                 spi_tx  = 8'hFF;
                 spi_req <= 1;
                 if (spi_done) begin
                     if (spi_rx_byte != 8'hFF) begin
                         // Got R1 - proceed to ACMD41 regardless of value
-                        sd_cs      <= 1;
                         cmd_idx    <= 0;
                         poll_cnt   <= 0;
                         // ACMD41 with HCS=1 (0x40000000) for SDHC
                         cmd_buf[0] = 8'h69; cmd_buf[1] = 8'h40;
                         cmd_buf[2] = 8'h00; cmd_buf[3] = 8'h00;
                         cmd_buf[4] = 8'h00; cmd_buf[5] = 8'hFF;
-                        state <= ST_ACMD41;
+                        init_next_state <= ST_ACMD41;
+                        state <= ST_INIT_GAP;
                     end else begin
                         poll_cnt <= poll_cnt + 1;
-                        if (poll_cnt >= 16'd50000) state <= ST_ERROR;
+                        if (poll_cnt >= 16'd60000) state <= ST_ERROR;
                     end
                 end
             end
@@ -354,6 +394,7 @@ always @(posedge clk) begin
         end
 
         ST_ACMD41_RESP: begin
+            sd_cs <= 0;
             if (!spi_busy && !spi_req) begin
                 spi_tx  = 8'hFF;
                 spi_req <= 1;
@@ -366,17 +407,17 @@ always @(posedge clk) begin
                         state     <= ST_READY;
                     end else if (spi_rx_byte == 8'h01) begin
                         // Still initialising, retry CMD55+ACMD41
-                        sd_cs    <= 1;
                         cmd_idx  <= 0;
                         poll_cnt <= 0;
                         retry    <= retry + 1;
-                        if (retry >= 16'd5000) begin
+                        if (retry >= 16'd20000) begin
                             state <= ST_ERROR;
                         end else begin
                             cmd_buf[0] = 8'h77; cmd_buf[1] = 8'h00;
                             cmd_buf[2] = 8'h00; cmd_buf[3] = 8'h00;
                             cmd_buf[4] = 8'h00; cmd_buf[5] = 8'hFF;
-                            state <= ST_CMD55;
+                            init_next_state <= ST_CMD55;
+                            state <= ST_INIT_GAP;
                         end
                     end
                     // 0xFF or other = keep polling

@@ -1,31 +1,29 @@
 // ============================================================
-// top.v -- Autonomous SD -> AES -> SD pipeline
+// top.v -- Autonomous SD -> AES -> SD image pipeline
 //
 // FLOW:
-//   1. After SD init, preload plaintext/key/expected-ct vectors
-//      from aes_vectors.hex into fixed DATA.BIN sectors.
-//   2. BTNC starts one full operation:
-//        read plaintext from SD
+//   1. After SD init, preload the image metadata block, AES key, and
+//      original image blocks from image.hex into DATA.BIN sectors.
+//   2. BTNC starts one full operation over every 16-byte image block:
 //        read key from SD
+//        read plaintext image block from SD
 //        AES encrypt
-//        write ciphertext to SD
-//        read ciphertext back from SD
+//        write ciphertext block to SD
+//        read ciphertext block back from SD
 //        AES decrypt
-//        write decrypted text to SD
-//   3. LEDs show init/preload/write/verify progress.
+//        write decrypted block to SD
+//   3. Verification passes only if every ciphertext readback matches
+//      what was written and every decrypted block matches plaintext.
 //
 // SD LAYOUT (DATA.BIN sectors 20+):
-//   sector 20 : plaintext     bytes 0..15 valid
-//   sector 21 : AES key       bytes 0..15 valid
-//   sector 22 : expected ct   bytes 0..15 valid
-//   sector 23 : ciphertext    bytes 0..15 valid
-//   sector 24 : decrypted     bytes 0..15 valid
+//   sector 20               : image metadata block from image.hex[0]
+//   sector 21               : AES key block
+//   sectors 22..217         : original image blocks (196 x 16-byte blocks)
+//   sectors 218..413        : encrypted image blocks
+//   sectors 414..609        : decrypted image blocks
 //
-// Byte order:
-//   block_byte(idx=0) writes blk[7:0] first, so SD bytes are the
-//   little-endian byte view of the 128-bit register value.
-//   Read capture uses the same mapping, so the AES cores see the
-//   original 128-bit word values from aes_vectors.hex.
+// Each sector carries exactly one 16-byte payload in bytes 0..15.
+// Bytes 16..511 are zero.
 // ============================================================
 module top (
     input  wire        CLK100MHZ,
@@ -82,21 +80,27 @@ assign SD_DAT3 = sd_cs_w;
 // ------------------------------------------------------------------
 // Fixed sector map
 // ------------------------------------------------------------------
-localparam [31:0] DATA_BASE_ADDR = 32'd20;
-localparam [31:0] PT_SECTOR      = DATA_BASE_ADDR + 32'd0;
-localparam [31:0] KEY_SECTOR     = DATA_BASE_ADDR + 32'd1;
-localparam [31:0] EXP_SECTOR     = DATA_BASE_ADDR + 32'd2;
-localparam [31:0] CT_SECTOR      = DATA_BASE_ADDR + 32'd3;
-localparam [31:0] DEC_SECTOR     = DATA_BASE_ADDR + 32'd4;
+localparam [31:0] DATA_BASE_ADDR      = 32'd20;
+localparam [31:0] META_SECTOR         = DATA_BASE_ADDR + 32'd0;
+localparam [31:0] KEY_SECTOR          = DATA_BASE_ADDR + 32'd1;
+localparam [31:0] PLAIN_BASE_SECTOR   = DATA_BASE_ADDR + 32'd2;
+localparam [127:0] ROM_KEY_BLOCK      = 128'h000102030405060708090A0B0C0D0E0F;
 
-// ------------------------------------------------------------------
-// AES vectors preloaded into SD after init.
-// Keep them as HDL constants instead of relying on $readmemh so the
-// synthesized bitstream always contains the expected test data.
-// ------------------------------------------------------------------
-localparam [127:0] ROM_PLAIN_BLOCK = 128'h00112233445566778899AABBCCDDEEFF;
-localparam [127:0] ROM_KEY_BLOCK   = 128'h000102030405060708090A0B0C0D0E0F;
-localparam [127:0] ROM_EXP_BLOCK   = 128'h69C4E0D86A7B0430D8CDB78070B4C55A;
+localparam integer IMAGE_ROM_BLOCKS = 197;
+localparam integer IMAGE_FILE_BLOCKS = 196;
+localparam [31:0] IMAGE_FILE_SIZE_BYTES = 32'h00000C36;
+reg [7:0] image_rom_addr = 8'd0;
+wire [127:0] image_rom_dout;
+reg [127:0] rom_block = 128'd0;
+
+image_rom_bram image_rom_u (
+    .clk (CLK100MHZ),
+    .addr(image_rom_addr),
+    .dout(image_rom_dout)
+);
+
+localparam [31:0] CT_BASE_SECTOR      = PLAIN_BASE_SECTOR + IMAGE_FILE_BLOCKS;
+localparam [31:0] DEC_BASE_SECTOR     = CT_BASE_SECTOR + IMAGE_FILE_BLOCKS;
 
 // ------------------------------------------------------------------
 // AES engine and working registers
@@ -161,37 +165,44 @@ function [7:0] block_byte;
     end
 endfunction
 
+// ------------------------------------------------------------------
+// Write source / read target selectors
+// ------------------------------------------------------------------
 localparam [2:0]
-    WS_ROM_PT  = 3'd0,
-    WS_ROM_KEY = 3'd1,
-    WS_ROM_EXP = 3'd2,
+    WS_META    = 3'd0,
+    WS_KEY     = 3'd1,
+    WS_ROM_IMG = 3'd2,
     WS_CT      = 3'd3,
     WS_DEC     = 3'd4;
 
-reg [2:0] wr_source = WS_ROM_PT;
-
-wire [127:0] wr_block =
-    (wr_source == WS_ROM_PT)  ? ROM_PLAIN_BLOCK :
-    (wr_source == WS_ROM_KEY) ? ROM_KEY_BLOCK   :
-    (wr_source == WS_ROM_EXP) ? ROM_EXP_BLOCK   :
-                                (wr_source == WS_CT)      ? ct_block        :
-                                                            dec_block;
-
-wire [7:0] wr_byte =
-    (wr_byte_idx < 9'd16) ? block_byte(wr_block, wr_byte_idx[3:0]) :
-                            8'h00;
-
-// ------------------------------------------------------------------
-// Read capture helpers
-// ------------------------------------------------------------------
 localparam [1:0]
     RT_NONE = 2'd0,
-    RT_PT   = 2'd1,
-    RT_KEY  = 2'd2,
+    RT_KEY  = 2'd1,
+    RT_PT   = 2'd2,
     RT_CT   = 2'd3;
 
+reg [2:0] wr_source = WS_META;
 reg [1:0] rd_target = RT_NONE;
 reg [4:0] rd_capture_idx = 5'd0;
+reg [8:0] preload_idx = 9'd0;
+reg [8:0] block_idx   = 9'd0;
+
+reg [127:0] wr_block;
+
+always @(*) begin
+    case (wr_source)
+        WS_META:    wr_block = rom_block;
+        WS_KEY:     wr_block = ROM_KEY_BLOCK;
+        WS_ROM_IMG: wr_block = rom_block;
+        WS_CT:      wr_block = ct_block;
+        default:    wr_block = dec_block;
+    endcase
+end
+
+wire [7:0] wr_byte;
+assign wr_byte =
+    (wr_byte_idx < 9'd16) ? block_byte(wr_block, wr_byte_idx[3:0]) :
+                            8'h00;
 
 // ------------------------------------------------------------------
 // UI / status / control
@@ -213,42 +224,36 @@ localparam [3:0]
     DISP_FAIL     = 4'hA,
     DISP_ERROR    = 4'hE;
 
-reg preload_done = 1'b0;
-reg ct_write_done = 1'b0;
+reg preload_done   = 1'b0;
+reg ct_write_done  = 1'b0;
 reg dec_write_done = 1'b0;
-reg verify_pass = 1'b0;
-reg op_done = 1'b0;
-reg op_error = 1'b0;
-reg ct_match = 1'b0;
-reg dec_match = 1'b0;
+reg verify_pass    = 1'b0;
+reg op_done        = 1'b0;
+reg op_error       = 1'b0;
+reg all_ct_match   = 1'b0;
+reg all_dec_match  = 1'b0;
 
 localparam [4:0]
-    ST_WAIT_INIT        = 5'd0,
-    ST_PRELOAD_PT       = 5'd1,
-    ST_PRELOAD_PT_WAIT  = 5'd2,
-    ST_PRELOAD_KEY      = 5'd3,
-    ST_PRELOAD_KEY_WAIT = 5'd4,
-    ST_PRELOAD_EXP      = 5'd5,
-    ST_PRELOAD_EXP_WAIT = 5'd6,
-    ST_IDLE_READY       = 5'd7,
-    ST_READ_PT          = 5'd8,
-    ST_READ_PT_WAIT     = 5'd9,
-    ST_READ_KEY         = 5'd10,
-    ST_READ_KEY_WAIT    = 5'd11,
-    ST_ENC_START        = 5'd12,
-    ST_ENC_WAIT_CLR     = 5'd13,
-    ST_ENC_WAIT_DONE    = 5'd14,
-    ST_WRITE_CT         = 5'd15,
-    ST_WRITE_CT_WAIT    = 5'd16,
-    ST_READ_CT          = 5'd17,
-    ST_READ_CT_WAIT     = 5'd18,
-    ST_DEC_START        = 5'd19,
-    ST_DEC_WAIT_CLR     = 5'd20,
-    ST_DEC_WAIT_DONE    = 5'd21,
-    ST_WRITE_DEC        = 5'd22,
-    ST_WRITE_DEC_WAIT   = 5'd23,
-    ST_DONE             = 5'd24,
-    ST_ERROR            = 5'd25;
+    ST_WAIT_INIT         = 5'd0,
+    ST_PRELOAD_META_REQ  = 5'd1,
+    ST_PRELOAD_META_LATCH= 5'd2,
+    ST_PRELOAD_META_WAIT = 5'd3,
+    ST_PRELOAD_KEY_WAIT  = 5'd4,
+    ST_PRELOAD_IMG_REQ   = 5'd5,
+    ST_PRELOAD_IMG_LATCH = 5'd6,
+    ST_PRELOAD_IMG_WAIT  = 5'd7,
+    ST_IDLE_READY        = 5'd8,
+    ST_READ_KEY_WAIT     = 5'd9,
+    ST_READ_PT_WAIT      = 5'd10,
+    ST_ENC_WAIT_CLR      = 5'd11,
+    ST_ENC_WAIT_DONE     = 5'd12,
+    ST_WRITE_CT_WAIT     = 5'd13,
+    ST_READ_CT_WAIT      = 5'd14,
+    ST_DEC_WAIT_CLR      = 5'd15,
+    ST_DEC_WAIT_DONE     = 5'd16,
+    ST_WRITE_DEC_WAIT    = 5'd17,
+    ST_DONE              = 5'd18,
+    ST_ERROR             = 5'd19;
 
 reg [4:0] ctrl_state = ST_WAIT_INIT;
 
@@ -259,6 +264,11 @@ wire local_busy =
     (ctrl_state != ST_ERROR);
 
 wire error_flag = init_err | op_error;
+wire [4:0] led_debug_state = error_flag ? debug_last : debug_state;
+wire [3:0] ui_digit =
+    error_flag ? debug_last[3:0] :
+    ((!init_done && busy) ? debug_state[3:0] : disp_digit);
+wire ui_show_digit = show_digit | (!init_done && busy) | error_flag;
 
 always @(posedge CLK100MHZ) begin
     rd_start      <= 1'b0;
@@ -271,7 +281,11 @@ always @(posedge CLK100MHZ) begin
         sd_addr         <= DATA_BASE_ADDR;
         rd_target       <= RT_NONE;
         rd_capture_idx  <= 5'd0;
-        wr_source       <= WS_ROM_PT;
+        wr_source       <= WS_META;
+        preload_idx     <= 9'd0;
+        block_idx       <= 9'd0;
+        image_rom_addr  <= 8'd0;
+        rom_block       <= 128'd0;
         pt_block        <= 128'd0;
         key_block       <= 128'd0;
         ct_block        <= 128'd0;
@@ -285,13 +299,13 @@ always @(posedge CLK100MHZ) begin
         verify_pass     <= 1'b0;
         op_done         <= 1'b0;
         op_error        <= 1'b0;
-        ct_match        <= 1'b0;
-        dec_match       <= 1'b0;
+        all_ct_match    <= 1'b0;
+        all_dec_match   <= 1'b0;
     end else begin
         if (rd_valid && (rd_capture_idx < 5'd16)) begin
             case (rd_target)
-                RT_PT:  pt_block[rd_capture_idx*8 +: 8]      <= rd_data;
                 RT_KEY: key_block[rd_capture_idx*8 +: 8]     <= rd_data;
+                RT_PT:  pt_block[rd_capture_idx*8 +: 8]      <= rd_data;
                 RT_CT:  ct_read_block[rd_capture_idx*8 +: 8] <= rd_data;
                 default: begin end
             endcase
@@ -309,18 +323,28 @@ always @(posedge CLK100MHZ) begin
                     disp_digit <= DISP_IDLE;
                     show_digit <= 1'b0;
                     if (init_done && !busy) begin
-                        wr_source   <= WS_ROM_PT;
-                        sd_addr     <= PT_SECTOR;
-                        wr_start    <= 1'b1;
                         disp_digit  <= DISP_PRELOAD;
                         show_digit  <= 1'b1;
-                        ctrl_state  <= ST_PRELOAD_PT_WAIT;
+                        image_rom_addr <= 8'd0;
+                        ctrl_state  <= ST_PRELOAD_META_REQ;
                     end
                 end
 
-                ST_PRELOAD_PT_WAIT: begin
+                ST_PRELOAD_META_REQ: begin
+                    ctrl_state <= ST_PRELOAD_META_LATCH;
+                end
+
+                ST_PRELOAD_META_LATCH: begin
+                    rom_block <= image_rom_dout;
+                    wr_source <= WS_META;
+                    sd_addr   <= META_SECTOR;
+                    wr_start  <= 1'b1;
+                    ctrl_state <= ST_PRELOAD_META_WAIT;
+                end
+
+                ST_PRELOAD_META_WAIT: begin
                     if (wr_done) begin
-                        wr_source  <= WS_ROM_KEY;
+                        wr_source  <= WS_KEY;
                         sd_addr    <= KEY_SECTOR;
                         wr_start   <= 1'b1;
                         ctrl_state <= ST_PRELOAD_KEY_WAIT;
@@ -329,18 +353,35 @@ always @(posedge CLK100MHZ) begin
 
                 ST_PRELOAD_KEY_WAIT: begin
                     if (wr_done) begin
-                        wr_source  <= WS_ROM_EXP;
-                        sd_addr    <= EXP_SECTOR;
-                        wr_start   <= 1'b1;
-                        ctrl_state <= ST_PRELOAD_EXP_WAIT;
+                        preload_idx <= 9'd0;
+                        image_rom_addr <= 8'd1;
+                        ctrl_state  <= ST_PRELOAD_IMG_REQ;
                     end
                 end
 
-                ST_PRELOAD_EXP_WAIT: begin
+                ST_PRELOAD_IMG_REQ: begin
+                    ctrl_state <= ST_PRELOAD_IMG_LATCH;
+                end
+
+                ST_PRELOAD_IMG_LATCH: begin
+                    rom_block  <= image_rom_dout;
+                    wr_source  <= WS_ROM_IMG;
+                    sd_addr    <= PLAIN_BASE_SECTOR + preload_idx;
+                    wr_start   <= 1'b1;
+                    ctrl_state <= ST_PRELOAD_IMG_WAIT;
+                end
+
+                ST_PRELOAD_IMG_WAIT: begin
                     if (wr_done) begin
-                        preload_done <= 1'b1;
-                        disp_digit   <= DISP_IDLE;
-                        ctrl_state   <= ST_IDLE_READY;
+                        if (preload_idx == IMAGE_FILE_BLOCKS - 1) begin
+                            preload_done <= 1'b1;
+                            disp_digit   <= DISP_IDLE;
+                            ctrl_state   <= ST_IDLE_READY;
+                        end else begin
+                            preload_idx <= preload_idx + 1'b1;
+                            image_rom_addr <= preload_idx + 9'd2;
+                            ctrl_state  <= ST_PRELOAD_IMG_REQ;
+                        end
                     end
                 end
 
@@ -353,24 +394,14 @@ always @(posedge CLK100MHZ) begin
                         verify_pass    <= 1'b0;
                         op_done        <= 1'b0;
                         op_error       <= 1'b0;
-                        ct_match       <= 1'b0;
-                        dec_match      <= 1'b0;
+                        all_ct_match   <= 1'b1;
+                        all_dec_match  <= 1'b1;
+                        block_idx      <= 9'd0;
                         pt_block       <= 128'd0;
                         key_block      <= 128'd0;
                         ct_block       <= 128'd0;
                         ct_read_block  <= 128'd0;
                         dec_block      <= 128'd0;
-                        rd_target      <= RT_PT;
-                        rd_capture_idx <= 5'd0;
-                        sd_addr        <= PT_SECTOR;
-                        rd_start       <= 1'b1;
-                        disp_digit     <= DISP_READ_PT;
-                        ctrl_state     <= ST_READ_PT_WAIT;
-                    end
-                end
-
-                ST_READ_PT_WAIT: begin
-                    if (rd_done) begin
                         rd_target      <= RT_KEY;
                         rd_capture_idx <= 5'd0;
                         sd_addr        <= KEY_SECTOR;
@@ -381,6 +412,18 @@ always @(posedge CLK100MHZ) begin
                 end
 
                 ST_READ_KEY_WAIT: begin
+                    if (rd_done) begin
+                        pt_block       <= 128'd0;
+                        rd_target      <= RT_PT;
+                        rd_capture_idx <= 5'd0;
+                        sd_addr        <= PLAIN_BASE_SECTOR + block_idx;
+                        rd_start       <= 1'b1;
+                        disp_digit     <= DISP_READ_PT;
+                        ctrl_state     <= ST_READ_PT_WAIT;
+                    end
+                end
+
+                ST_READ_PT_WAIT: begin
                     if (rd_done) begin
                         aes_enc_start <= 1'b1;
                         disp_digit    <= DISP_ENC;
@@ -398,7 +441,7 @@ always @(posedge CLK100MHZ) begin
                     if (aes_enc_done) begin
                         ct_block    <= aes_enc_out;
                         wr_source   <= WS_CT;
-                        sd_addr     <= CT_SECTOR;
+                        sd_addr     <= CT_BASE_SECTOR + block_idx;
                         wr_start    <= 1'b1;
                         disp_digit  <= DISP_WRITE_CT;
                         ctrl_state  <= ST_WRITE_CT_WAIT;
@@ -407,20 +450,22 @@ always @(posedge CLK100MHZ) begin
 
                 ST_WRITE_CT_WAIT: begin
                     if (wr_done) begin
-                        ct_write_done <= 1'b1;
-                        ct_read_block <= 128'd0;
-                        rd_target     <= RT_CT;
-                        rd_capture_idx<= 5'd0;
-                        sd_addr       <= CT_SECTOR;
-                        rd_start      <= 1'b1;
-                        disp_digit    <= DISP_READ_CT;
-                        ctrl_state    <= ST_READ_CT_WAIT;
+                        if (block_idx == IMAGE_FILE_BLOCKS - 1) begin
+                            ct_write_done <= 1'b1;
+                        end
+                        ct_read_block  <= 128'd0;
+                        rd_target      <= RT_CT;
+                        rd_capture_idx <= 5'd0;
+                        sd_addr        <= CT_BASE_SECTOR + block_idx;
+                        rd_start       <= 1'b1;
+                        disp_digit     <= DISP_READ_CT;
+                        ctrl_state     <= ST_READ_CT_WAIT;
                     end
                 end
 
                 ST_READ_CT_WAIT: begin
                     if (rd_done) begin
-                        ct_match      <= (ct_read_block == ROM_EXP_BLOCK);
+                        all_ct_match  <= all_ct_match & (ct_read_block == ct_block);
                         aes_dec_start <= 1'b1;
                         disp_digit    <= DISP_DEC;
                         ctrl_state    <= ST_DEC_WAIT_CLR;
@@ -435,23 +480,37 @@ always @(posedge CLK100MHZ) begin
 
                 ST_DEC_WAIT_DONE: begin
                     if (aes_dec_done) begin
-                        dec_block   <= aes_dec_out;
-                        dec_match   <= (aes_dec_out == pt_block);
-                        wr_source   <= WS_DEC;
-                        sd_addr     <= DEC_SECTOR;
-                        wr_start    <= 1'b1;
-                        disp_digit  <= DISP_WRITE_DC;
-                        ctrl_state  <= ST_WRITE_DEC_WAIT;
+                        dec_block     <= aes_dec_out;
+                        all_dec_match <= all_dec_match & (aes_dec_out == pt_block);
+                        wr_source     <= WS_DEC;
+                        sd_addr       <= DEC_BASE_SECTOR + block_idx;
+                        wr_start      <= 1'b1;
+                        disp_digit    <= DISP_WRITE_DC;
+                        ctrl_state    <= ST_WRITE_DEC_WAIT;
                     end
                 end
 
                 ST_WRITE_DEC_WAIT: begin
                     if (wr_done) begin
-                        dec_write_done <= 1'b1;
-                        verify_pass    <= ct_match && dec_match;
-                        op_done        <= 1'b1;
-                        disp_digit     <= (ct_match && dec_match) ? DISP_PASS : DISP_FAIL;
-                        ctrl_state     <= ST_DONE;
+                        if (block_idx == IMAGE_FILE_BLOCKS - 1) begin
+                            dec_write_done <= 1'b1;
+                            verify_pass    <= all_ct_match & all_dec_match;
+                            op_done        <= 1'b1;
+                            disp_digit     <= (all_ct_match & all_dec_match) ? DISP_PASS : DISP_FAIL;
+                            ctrl_state     <= ST_DONE;
+                        end else begin
+                            block_idx      <= block_idx + 1'b1;
+                            pt_block       <= 128'd0;
+                            ct_block       <= 128'd0;
+                            ct_read_block  <= 128'd0;
+                            dec_block      <= 128'd0;
+                            rd_target      <= RT_PT;
+                            rd_capture_idx <= 5'd0;
+                            sd_addr        <= PLAIN_BASE_SECTOR + block_idx + 32'd1;
+                            rd_start       <= 1'b1;
+                            disp_digit     <= DISP_READ_PT;
+                            ctrl_state     <= ST_READ_PT_WAIT;
+                        end
                     end
                 end
 
@@ -507,8 +566,8 @@ sd_spi_controller sd0 (
 // ------------------------------------------------------------------
 seven_seg seg_disp (
     .clk       (CLK100MHZ),
-    .digit     (disp_digit),
-    .show_digit(show_digit),
+    .digit     (ui_digit),
+    .show_digit(ui_show_digit),
     .init_ok   (init_done),
     .error_flag(error_flag),
     .an        (AN),
@@ -523,14 +582,38 @@ assign LED[1]      = preload_done;
 assign LED[2]      = ct_write_done;
 assign LED[3]      = dec_write_done;
 assign LED[4]      = verify_pass;
-assign LED[5]      = ct_match;
+assign LED[5]      = all_ct_match;
 assign LED[6]      = busy | local_busy;
 assign LED[9:7]    = 3'b000;
-assign LED[14:10]  = debug_last;
+assign LED[14:10]  = led_debug_state;
 assign LED[15]     = error_flag;
 
 // Keep otherwise-unused signals tied to avoid warnings.
 wire _unused_btn_levels = btn_start_level ^ btn_rst_pulse;
-wire [4:0] _unused_debug_state = debug_state;
+wire [31:0] _unused_image_file_size;
+assign _unused_image_file_size = IMAGE_FILE_SIZE_BYTES;
+
+endmodule
+
+module image_rom_bram (
+    input  wire        clk,
+    input  wire [7:0]  addr,
+    output reg  [127:0] dout
+);
+
+(* rom_style = "block", ram_style = "block" *)
+reg [127:0] image_rom [0:255];
+integer i;
+
+initial begin
+    for (i = 0; i < 256; i = i + 1) begin
+        image_rom[i] = 128'd0;
+    end
+`include "image_rom.vh"
+end
+
+always @(posedge clk) begin
+    dout <= image_rom[addr];
+end
 
 endmodule

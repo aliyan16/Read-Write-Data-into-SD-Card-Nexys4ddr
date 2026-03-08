@@ -1,12 +1,13 @@
 r"""
-verify_sd.py -- Read back SD card and check the autonomous AES SD pipeline.
-Run as Administrator.
+verify_sd.py -- Read back SD card and check the SD image AES pipeline.
+Run as Administrator on Windows.
 
 Usage:
     python verify_sd.py
-    python verify_sd.py \\\\.\\PhysicalDrive1
-    python verify_sd.py \\\\.\\PhysicalDrive1 20
+    python verify_sd.py \\.\PhysicalDrive1
+    python verify_sd.py \\.\PhysicalDrive1 --no-open
 """
+import math
 import os
 import struct
 import sys
@@ -25,36 +26,22 @@ def open_raw_device(path, mode):
         return os.fdopen(fd, mode, buffering=0)
     return open(path, mode)
 
-DEVICE = sys.argv[1] if len(sys.argv) > 1 else r"\\.\PhysicalDrive1"
-DATA_BASE_OVERRIDE = int(sys.argv[2]) if len(sys.argv) > 2 else None
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VECTOR_PATH = os.path.join(SCRIPT_DIR, "aes_vectors.hex")
-ENTRY_SIZE = 32
+
+def parse_args(argv):
+    device = r"\\.\PhysicalDrive1"
+    auto_open = True
+
+    for arg in argv[1:]:
+        if arg == "--no-open":
+            auto_open = False
+        elif arg.startswith("\\\\.\\") or arg.startswith("/dev/"):
+            device = arg
+
+    return device, auto_open
 
 
 def fmt_bytes(data):
     return " ".join(f"{b:02X}" for b in data)
-
-
-def le_bytes_to_block_hex(data):
-    return "".join(f"{b:02X}" for b in reversed(data))
-
-
-def load_vector_bytes():
-    try:
-        with open(VECTOR_PATH, "r", encoding="ascii") as vf:
-            rows = [line.strip() for line in vf if line.strip()]
-    except OSError:
-        return None
-
-    if len(rows) < 3:
-        return None
-
-    return {
-        "Plaintext": bytes.fromhex(rows[0])[::-1],
-        "Key": bytes.fromhex(rows[1])[::-1],
-        "Expected CT": bytes.fromhex(rows[2])[::-1],
-    }
 
 
 def parse_boot_sector(boot):
@@ -66,7 +53,7 @@ def parse_boot_sector(boot):
     total_sectors_16 = struct.unpack_from("<H", boot, 19)[0]
     fat_sectors = struct.unpack_from("<H", boot, 22)[0]
     total_sectors_32 = struct.unpack_from("<L", boot, 32)[0]
-    root_sectors = ((root_entries * ENTRY_SIZE) + (bytes_per_sector - 1)) // bytes_per_sector
+    root_sectors = ((root_entries * 32) + (bytes_per_sector - 1)) // bytes_per_sector
     data_start_sector = reserved_sectors + (num_fats * fat_sectors) + root_sectors
     total_sectors = total_sectors_16 or total_sectors_32
 
@@ -84,39 +71,97 @@ def parse_boot_sector(boot):
 
 
 def find_data_bin_entry(root_dir, root_entries):
-    target = b"DATA    BIN"
     for idx in range(root_entries):
-        entry = root_dir[idx * ENTRY_SIZE:(idx + 1) * ENTRY_SIZE]
-        if len(entry) < ENTRY_SIZE or entry[0] in (0x00, 0xE5):
+        entry = root_dir[idx * 32:(idx + 1) * 32]
+        if len(entry) < 32 or entry[0] in (0x00, 0xE5):
             continue
-        if entry[0:11] == target:
+        if entry[0:11] == b"DATA    BIN":
             return idx, entry
     return None, None
 
 
+def read_sector_block(fh, sector, bytes_per_sector):
+    fh.seek(sector * bytes_per_sector)
+    data = fh.read(bytes_per_sector)
+    if len(data) != bytes_per_sector:
+        raise OSError(f"short read at sector {sector}")
+    return data
+
+
+def detect_file_ext(data):
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"P5") or data.startswith(b"P2"):
+        return ".pgm"
+    return ".bin"
+
+
+def parse_bmp_info(data):
+    if len(data) < 54 or data[0:2] != b"BM":
+        return None
+
+    return {
+        "file_size": struct.unpack_from("<I", data, 2)[0],
+        "pixel_offset": struct.unpack_from("<I", data, 10)[0],
+        "dib_size": struct.unpack_from("<I", data, 14)[0],
+        "width": struct.unpack_from("<i", data, 18)[0],
+        "height": struct.unpack_from("<i", data, 22)[0],
+        "bpp": struct.unpack_from("<H", data, 28)[0],
+        "image_size": struct.unpack_from("<I", data, 34)[0],
+    }
+
+
+def make_viewable_encrypted_bmp(original_bytes, encrypted_bytes):
+    bmp = parse_bmp_info(original_bytes)
+    if not bmp:
+        return None
+
+    pixel_offset = bmp["pixel_offset"]
+    if len(original_bytes) < pixel_offset:
+        return None
+
+    rebuilt = bytearray(original_bytes[:pixel_offset])
+    rebuilt.extend(encrypted_bytes[pixel_offset:len(original_bytes)])
+    if len(rebuilt) < len(original_bytes):
+        rebuilt.extend(b"\x00" * (len(original_bytes) - len(rebuilt)))
+    return bytes(rebuilt[:len(original_bytes)])
+
+
+def write_output(path, data):
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
+def maybe_open(paths, auto_open):
+    if not auto_open or sys.platform != "win32":
+        return
+
+    for path in paths:
+        try:
+            os.startfile(path)
+        except OSError:
+            pass
+
+
+DEVICE, AUTO_OPEN = parse_args(sys.argv)
+
 try:
     with open_raw_device(DEVICE, "rb") as f:
-        # Boot sector
-        f.seek(0)
-        boot = f.read(512)
-        if len(boot) != 512:
-            raise OSError("could not read full boot sector")
-
+        boot = read_sector_block(f, 0, 512)
         bpb = parse_boot_sector(boot)
         sig_ok = boot[510:512] == b"\x55\xAA"
         fs_type = boot[54:62].decode("ascii", errors="replace").strip()
         vol_label = boot[43:54].decode("ascii", errors="replace").strip()
+
         print("=== Boot Sector ===")
         print(f"  Signature  : {'OK (55 AA)' if sig_ok else 'BAD - FAT not written!'}")
         print(f"  FS type    : {fs_type!r}")
         print(f"  Volume     : {vol_label!r}")
         print(f"  Sector size: {bpb['bytes_per_sector']} bytes")
-        print(f"  FAT copies : {bpb['num_fats']}")
-        print(f"  FAT size   : {bpb['fat_sectors']} sectors each")
-        print(f"  Root dir   : {bpb['root_sectors']} sector(s)")
         print(f"  Data start : sector {bpb['data_start_sector']}")
 
-        # Root directory entry
         root_dir_sector = bpb["reserved_sectors"] + (bpb["num_fats"] * bpb["fat_sectors"])
         root_dir_size = bpb["root_sectors"] * bpb["bytes_per_sector"]
         f.seek(root_dir_sector * bpb["bytes_per_sector"])
@@ -125,86 +170,118 @@ try:
         if entry is None:
             raise OSError("DATA.BIN entry not found in root directory")
 
-        name = entry[0:8].decode("ascii", errors="replace").rstrip()
-        ext = entry[8:11].decode("ascii", errors="replace").rstrip()
-        attr = entry[11]
         cluster = struct.unpack_from("<H", entry, 26)[0]
         file_size = struct.unpack_from("<L", entry, 28)[0]
-        derived_base_sector = bpb["data_start_sector"] + ((cluster - 2) * bpb["sectors_per_cluster"])
-        data_base = DATA_BASE_OVERRIDE if DATA_BASE_OVERRIDE is not None else derived_base_sector
+        data_base = bpb["data_start_sector"] + ((cluster - 2) * bpb["sectors_per_cluster"])
 
-        print(f"\n=== Root Directory Entry {entry_idx} ===")
-        print(f"  Filename   : {name}.{ext}")
-        print(f"  Attribute  : 0x{attr:02X}")
-        print(f"  1st cluster: {cluster}")
-        print(
-            f"  File size  : {file_size} bytes  "
-            f"({'OK - 1 MB' if file_size == 1048576 else 'WRONG - should be 1048576'})"
-        )
-        print(f"  DATA.BIN   : starts at physical sector {derived_base_sector}")
-        if DATA_BASE_OVERRIDE is not None and DATA_BASE_OVERRIDE != derived_base_sector:
-            print(
-                f"  WARNING    : CLI base sector {DATA_BASE_OVERRIDE} overrides FAT-derived "
-                f"sector {derived_base_sector}"
-            )
+        print("\n=== Root Directory Entry ===")
+        print(f"  Entry index : {entry_idx}")
+        print(f"  Filename    : {entry[0:8].decode('ascii', errors='replace').rstrip()}.{entry[8:11].decode('ascii', errors='replace').rstrip()}")
+        print(f"  1st cluster : {cluster}")
+        print(f"  File size   : {file_size} bytes")
+        print(f"  DATA.BIN    : starts at physical sector {data_base}")
 
-        sectors = [
-            ("Plaintext", data_base + 0, 0),
-            ("Key", data_base + 1, 512),
-            ("Expected CT", data_base + 2, 1024),
-            ("Ciphertext", data_base + 3, 1536),
-            ("Decrypted", data_base + 4, 2048),
-        ]
+        meta_sector = data_base + 0
+        key_sector = data_base + 1
+        meta_sector_bytes = read_sector_block(f, meta_sector, bpb["bytes_per_sector"])
+        key_sector_bytes = read_sector_block(f, key_sector, bpb["bytes_per_sector"])
+        meta_block = meta_sector_bytes[:16]
+        key_block = key_sector_bytes[:16]
 
-        vector_bytes = load_vector_bytes()
-        blocks = {}
-        print(f"\n=== DATA.BIN AES Pipeline View (base sector {data_base}) ===")
-        print("  Valid payload bytes for each AES block are byte offsets 0..15 of the 512-byte sector.")
-        print("  Byte offsets 16..511 should be 00.")
-        for label, sector, file_offset in sectors:
-            f.seek(sector * bpb["bytes_per_sector"])
-            raw_sector = f.read(bpb["bytes_per_sector"])
-            if len(raw_sector) != bpb["bytes_per_sector"]:
-                raise OSError(f"short read at sector {sector}")
+        image_size_be = int.from_bytes(meta_block[0:4], "big")
+        image_size_le = int.from_bytes(meta_block[0:4], "little")
+        image_file_size = image_size_be if 0 < image_size_be < file_size else image_size_le
+        image_block_count = int(math.ceil(image_file_size / 16.0))
 
-            block = raw_sector[:16]
-            tail = raw_sector[16:]
-            tail_zero = all(b == 0 for b in tail)
-            blocks[label] = block
-            print(
-                f"  {label:<11} sector {sector}  "
-                f"(disk byte offset {sector * bpb['bytes_per_sector']}, "
-                f"DATA.BIN byte offset {file_offset})"
-            )
-            print(f"    bytes[0:16]  : {fmt_bytes(block)}")
-            print(f"    block value  : {le_bytes_to_block_hex(block)}")
-            print(f"    bytes[16:512]: {'all 00' if tail_zero else 'NONZERO DATA PRESENT'}")
-            if vector_bytes and label in vector_bytes:
-                exp = vector_bytes[label]
-                print(f"    expected     : {fmt_bytes(exp)}")
-                print(f"    vector check : {'MATCH' if block == exp else 'DIFFER'}")
+        plain_base = data_base + 2
+        ct_base = plain_base + image_block_count
+        dec_base = ct_base + image_block_count
 
-        ct_ok = blocks["Ciphertext"] == blocks["Expected CT"]
-        dec_ok = blocks["Decrypted"] == blocks["Plaintext"]
+        print("\n=== Image Layout ===")
+        print(f"  Metadata sector  : {meta_sector}")
+        print(f"  Key sector       : {key_sector}")
+        print(f"  Original sectors : {plain_base}..{plain_base + image_block_count - 1}")
+        print(f"  Cipher sectors   : {ct_base}..{ct_base + image_block_count - 1}")
+        print(f"  Decrypt sectors  : {dec_base}..{dec_base + image_block_count - 1}")
+        print(f"  Image bytes      : {image_file_size}")
+        print(f"  AES blocks       : {image_block_count}")
+        print(f"  Last block valid : {image_file_size - ((image_block_count - 1) * 16)} bytes")
+        print(f"  Metadata block   : {fmt_bytes(meta_block)}")
+        print(f"  Key block        : {fmt_bytes(key_block)}")
+
+        def read_payload_range(base_sector, block_count):
+            payload = bytearray()
+            nonzero_tail = False
+            first_sector_preview = None
+
+            for idx in range(block_count):
+                sector = base_sector + idx
+                sector_bytes = read_sector_block(f, sector, bpb["bytes_per_sector"])
+                payload.extend(sector_bytes[:16])
+                if any(b != 0 for b in sector_bytes[16:]):
+                    nonzero_tail = True
+                if idx == 0:
+                    first_sector_preview = sector_bytes[:32]
+
+            return bytes(payload[:image_file_size]), nonzero_tail, first_sector_preview
+
+        original_bytes, plain_nonzero_tail, plain_preview = read_payload_range(plain_base, image_block_count)
+        encrypted_bytes, ct_nonzero_tail, ct_preview = read_payload_range(ct_base, image_block_count)
+        decrypted_bytes, dec_nonzero_tail, dec_preview = read_payload_range(dec_base, image_block_count)
+
+        original_ext = detect_file_ext(original_bytes)
+        bmp_info = parse_bmp_info(original_bytes)
+
+        print("\n=== Sector Payload Checks ===")
+        print(f"  Original sector[0] first 32 bytes : {fmt_bytes(plain_preview)}")
+        print(f"  Cipher sector[0]  first 32 bytes  : {fmt_bytes(ct_preview)}")
+        print(f"  Decrypt sector[0] first 32 bytes  : {fmt_bytes(dec_preview)}")
+        print(f"  Original bytes[16:512] zero in every sector : {'YES' if not plain_nonzero_tail else 'NO'}")
+        print(f"  Cipher bytes[16:512] zero in every sector   : {'YES' if not ct_nonzero_tail else 'NO'}")
+        print(f"  Decrypt bytes[16:512] zero in every sector  : {'YES' if not dec_nonzero_tail else 'NO'}")
+
+        if bmp_info:
+            print("\n=== BMP Info ===")
+            print(f"  Width       : {bmp_info['width']}")
+            print(f"  Height      : {bmp_info['height']}")
+            print(f"  Bits/pixel  : {bmp_info['bpp']}")
+            print(f"  Pixel offset: {bmp_info['pixel_offset']}")
+            print(f"  Image bytes : {bmp_info['image_size']}")
+
+        dec_ok = decrypted_bytes == original_bytes
+        ct_differs = encrypted_bytes != original_bytes
 
         print("\n=== Checks ===")
-        print("  Ciphertext vs Expected CT : " + ("MATCH" if ct_ok else "DIFFER"))
-        print("  Decrypted vs Plaintext    : " + ("MATCH" if dec_ok else "DIFFER"))
-        if vector_bytes:
-            print(
-                "  Plaintext vs aes_vectors  : "
-                + ("MATCH" if blocks["Plaintext"] == vector_bytes["Plaintext"] else "DIFFER")
-            )
-            print(
-                "  Key vs aes_vectors        : "
-                + ("MATCH" if blocks["Key"] == vector_bytes["Key"] else "DIFFER")
-            )
-            print(
-                "  Expected CT vs vectors    : "
-                + ("MATCH" if blocks["Expected CT"] == vector_bytes["Expected CT"] else "DIFFER")
-            )
-        print("  Overall                   : " + ("PASS" if ct_ok and dec_ok else "FAIL"))
+        print("  Decrypted vs Original : " + ("MATCH" if dec_ok else "DIFFER"))
+        print("  Encrypted vs Original : " + ("DIFFER" if ct_differs else "IDENTICAL"))
+        print("  Overall               : " + ("PASS" if dec_ok else "FAIL"))
 
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_outputs")
+        os.makedirs(out_dir, exist_ok=True)
+
+        original_path = os.path.join(out_dir, "original_from_sd" + original_ext)
+        decrypted_path = os.path.join(out_dir, "decrypted_from_sd" + original_ext)
+        write_output(original_path, original_bytes)
+        write_output(decrypted_path, decrypted_bytes)
+
+        open_paths = [original_path, decrypted_path]
+
+        if bmp_info:
+            encrypted_view = make_viewable_encrypted_bmp(original_bytes, encrypted_bytes)
+            encrypted_path = os.path.join(out_dir, "encrypted_view.bmp")
+            write_output(encrypted_path, encrypted_view if encrypted_view is not None else encrypted_bytes)
+            open_paths.insert(1, encrypted_path)
+        else:
+            encrypted_path = os.path.join(out_dir, "encrypted_from_sd" + original_ext)
+            write_output(encrypted_path, encrypted_bytes)
+            open_paths.insert(1, encrypted_path)
+
+        print("\n=== Output Files ===")
+        print(f"  Original : {original_path}")
+        print(f"  Encrypted: {encrypted_path}")
+        print(f"  Decrypted: {decrypted_path}")
+
+        maybe_open(open_paths, AUTO_OPEN)
         print("\nDone.")
 
 except PermissionError:
