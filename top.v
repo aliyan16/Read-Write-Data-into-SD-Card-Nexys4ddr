@@ -1,31 +1,37 @@
 // ============================================================
-// top.v -- Single-sector Plain/Encrypt/Decrypt flow
+// top.v -- Autonomous SD -> AES -> SD pipeline
 //
 // FLOW:
-//   BTNC : write plain digit (from SW4_1) into selected sector
-//   BTNU : encrypt current plain block, store in same selected sector
-//   BTNR : decrypt current encrypted block, store in same selected sector
-//   BTNL : clear selected sector payload
+//   1. After SD init, preload plaintext/key/expected-ct vectors
+//      from aes_vectors.hex into fixed DATA.BIN sectors.
+//   2. BTNC starts one full operation:
+//        read plaintext from SD
+//        read key from SD
+//        AES encrypt
+//        write ciphertext to SD
+//        read ciphertext back from SD
+//        AES decrypt
+//        write decrypted text to SD
+//   3. LEDs show init/preload/write/verify progress.
 //
-// STORAGE LAYOUT INSIDE ONE 512-byte SECTOR:
-//   bytes  0..15  : plain AES block
-//   bytes 16..31  : encrypted AES block
-//   bytes 32..47  : decrypted AES block
-//   bytes 48..511 : 0x00
+// SD LAYOUT (DATA.BIN sectors 20+):
+//   sector 20 : plaintext     bytes 0..15 valid
+//   sector 21 : AES key       bytes 0..15 valid
+//   sector 22 : expected ct   bytes 0..15 valid
+//   sector 23 : ciphertext    bytes 0..15 valid
+//   sector 24 : decrypted     bytes 0..15 valid
+//
+// Byte order:
+//   block_byte(idx=0) writes blk[7:0] first, so SD bytes are the
+//   little-endian byte view of the 128-bit register value.
+//   Read capture uses the same mapping, so the AES cores see the
+//   original 128-bit word values from aes_vectors.hex.
 // ============================================================
 module top (
     input  wire        CLK100MHZ,
 
-    // Switches
-    input  wire        SW0,       // unused (kept for pin compatibility)
-    input  wire [3:0]  SW4_1,
-    input  wire [10:0] SW15_5,
-
     // Buttons
-    input  wire        BTNC,      // write plain
-    input  wire        BTNU,      // encrypt
-    input  wire        BTNR,      // decrypt
-    input  wire        BTNL,      // clear
+    input  wire        BTNC,      // start operation
     input  wire        BTND,      // reset
 
     // SD card (J1 microSD slot)
@@ -34,7 +40,6 @@ module top (
     output wire        SD_CMD,
     input  wire        SD_DAT0,
     output wire        SD_DAT3,
-    input  wire        SD_CD,
 
     // 7-segment display
     output wire [7:0]  AN,
@@ -47,18 +52,12 @@ module top (
 // ------------------------------------------------------------------
 // Debounced buttons
 // ------------------------------------------------------------------
-wire btn_wr_pulse,  btn_wr_level;
-wire btn_enc_pulse, btn_enc_level;
-wire btn_dec_pulse, btn_dec_level;
-wire btn_clr_pulse, btn_clr_level;
+wire btn_start_pulse, btn_start_level;
 wire btn_rst_pulse, btn_rst_level;
 wire rst = btn_rst_level;
 
-debounce db_wr  (.clk(CLK100MHZ), .btn_in(BTNC), .btn_out(btn_wr_level),  .btn_pulse(btn_wr_pulse));
-debounce db_enc (.clk(CLK100MHZ), .btn_in(BTNU), .btn_out(btn_enc_level), .btn_pulse(btn_enc_pulse));
-debounce db_dec (.clk(CLK100MHZ), .btn_in(BTNR), .btn_out(btn_dec_level), .btn_pulse(btn_dec_pulse));
-debounce db_clr (.clk(CLK100MHZ), .btn_in(BTNL), .btn_out(btn_clr_level), .btn_pulse(btn_clr_pulse));
-debounce db_rst (.clk(CLK100MHZ), .btn_in(BTND), .btn_out(btn_rst_level), .btn_pulse(btn_rst_pulse));
+debounce db_start (.clk(CLK100MHZ), .btn_in(BTNC), .btn_out(btn_start_level), .btn_pulse(btn_start_pulse));
+debounce db_rst   (.clk(CLK100MHZ), .btn_in(BTND), .btn_out(btn_rst_level),   .btn_pulse(btn_rst_pulse));
 
 // ------------------------------------------------------------------
 // SD controller I/O
@@ -72,7 +71,7 @@ wire [8:0] wr_byte_idx;
 wire [4:0] debug_state;
 wire [4:0] debug_last;
 
-reg        rd_start = 1'b0; // unused in this flow
+reg        rd_start = 1'b0;
 reg        wr_start = 1'b0;
 reg [31:0] sd_addr  = 32'd20;
 
@@ -80,18 +79,33 @@ assign SD_SCK  = sd_sclk_w;
 assign SD_CMD  = sd_mosi_w;
 assign SD_DAT3 = sd_cs_w;
 
-wire [31:0] input_addr  = 32'd20 + {21'b0, SW15_5};
-wire [7:0]  input_ascii = {4'h3, SW4_1};
+// ------------------------------------------------------------------
+// Fixed sector map
+// ------------------------------------------------------------------
+localparam [31:0] DATA_BASE_ADDR = 32'd20;
+localparam [31:0] PT_SECTOR      = DATA_BASE_ADDR + 32'd0;
+localparam [31:0] KEY_SECTOR     = DATA_BASE_ADDR + 32'd1;
+localparam [31:0] EXP_SECTOR     = DATA_BASE_ADDR + 32'd2;
+localparam [31:0] CT_SECTOR      = DATA_BASE_ADDR + 32'd3;
+localparam [31:0] DEC_SECTOR     = DATA_BASE_ADDR + 32'd4;
 
 // ------------------------------------------------------------------
-// AES engine
+// AES vectors preloaded into SD after init.
+// Keep them as HDL constants instead of relying on $readmemh so the
+// synthesized bitstream always contains the expected test data.
 // ------------------------------------------------------------------
-localparam [127:0] AES_KEY = 128'h00112233445566778899AABBCCDDEEFF;
+localparam [127:0] ROM_PLAIN_BLOCK = 128'h00112233445566778899AABBCCDDEEFF;
+localparam [127:0] ROM_KEY_BLOCK   = 128'h000102030405060708090A0B0C0D0E0F;
+localparam [127:0] ROM_EXP_BLOCK   = 128'h69C4E0D86A7B0430D8CDB78070B4C55A;
 
-reg  [127:0] plain_block     = 128'd0;
-reg  [127:0] enc_block       = 128'd0;
-reg  [127:0] dec_block       = 128'd0;
-reg  [127:0] dec_input_block = 128'd0;
+// ------------------------------------------------------------------
+// AES engine and working registers
+// ------------------------------------------------------------------
+reg  [127:0] pt_block      = 128'd0;
+reg  [127:0] key_block     = 128'd0;
+reg  [127:0] ct_block      = 128'd0;
+reg  [127:0] ct_read_block = 128'd0;
+reg  [127:0] dec_block     = 128'd0;
 
 reg  aes_enc_start = 1'b0;
 wire aes_enc_done;
@@ -104,8 +118,8 @@ wire [127:0] aes_dec_out;
 ASMD_Encryption aes_enc_u (
     .done         (aes_enc_done),
     .Dout         (aes_enc_out),
-    .plain_text_in(plain_block),
-    .key_in       (AES_KEY),
+    .plain_text_in(pt_block),
+    .key_in       (key_block),
     .encrypt      (aes_enc_start),
     .clock        (CLK100MHZ),
     .reset        (rst)
@@ -114,8 +128,8 @@ ASMD_Encryption aes_enc_u (
 ASMD_Decryption aes_dec_u (
     .done             (aes_dec_done),
     .Dout             (aes_dec_out),
-    .encrypted_text_in(dec_input_block),
-    .key_in           (AES_KEY),
+    .encrypted_text_in(ct_read_block),
+    .key_in           (key_block),
     .decrypt          (aes_dec_start),
     .clock            (CLK100MHZ),
     .reset            (rst)
@@ -147,42 +161,104 @@ function [7:0] block_byte;
     end
 endfunction
 
+localparam [2:0]
+    WS_ROM_PT  = 3'd0,
+    WS_ROM_KEY = 3'd1,
+    WS_ROM_EXP = 3'd2,
+    WS_CT      = 3'd3,
+    WS_DEC     = 3'd4;
+
+reg [2:0] wr_source = WS_ROM_PT;
+
+wire [127:0] wr_block =
+    (wr_source == WS_ROM_PT)  ? ROM_PLAIN_BLOCK :
+    (wr_source == WS_ROM_KEY) ? ROM_KEY_BLOCK   :
+    (wr_source == WS_ROM_EXP) ? ROM_EXP_BLOCK   :
+                                (wr_source == WS_CT)      ? ct_block        :
+                                                            dec_block;
+
 wire [7:0] wr_byte =
-    (wr_byte_idx < 9'd16) ? block_byte(plain_block, wr_byte_idx[3:0]) :
-    (wr_byte_idx < 9'd32) ? block_byte(enc_block,   wr_byte_idx[3:0]) :
-    (wr_byte_idx < 9'd48) ? block_byte(dec_block,   wr_byte_idx[3:0]) :
+    (wr_byte_idx < 9'd16) ? block_byte(wr_block, wr_byte_idx[3:0]) :
                             8'h00;
 
 // ------------------------------------------------------------------
-// UI & Control FSM
+// Read capture helpers
+// ------------------------------------------------------------------
+localparam [1:0]
+    RT_NONE = 2'd0,
+    RT_PT   = 2'd1,
+    RT_KEY  = 2'd2,
+    RT_CT   = 2'd3;
+
+reg [1:0] rd_target = RT_NONE;
+reg [4:0] rd_capture_idx = 5'd0;
+
+// ------------------------------------------------------------------
+// UI / status / control
 // ------------------------------------------------------------------
 reg [3:0] disp_digit = 4'd0;
 reg       show_digit = 1'b0;
 
-reg write_led = 1'b0;
-reg enc_led   = 1'b0;
-reg dec_led   = 1'b0;
-reg clr_led   = 1'b0;
-
-reg [31:0] op_addr = 32'd20;
-
-reg [3:0] ctrl_state = 4'd0;
 localparam [3:0]
-    CS_IDLE           = 4'd0,
-    CS_WAIT_WR_PLAIN  = 4'd1,
-    CS_ENC_START      = 4'd2,
-    CS_ENC_WAIT_CLR   = 4'd3,
-    CS_ENC_WAIT_DONE  = 4'd4,
-    CS_WAIT_WR_ENC    = 4'd5,
-    CS_DEC_START      = 4'd6,
-    CS_DEC_WAIT_CLR   = 4'd7,
-    CS_DEC_WAIT_DONE  = 4'd8,
-    CS_WAIT_WR_DEC    = 4'd9,
-    CS_WAIT_WR_CLR    = 4'd10,
-    CS_PREP_WR_PLAIN  = 4'd11,
-    CS_PREP_WR_ENC    = 4'd12,
-    CS_PREP_WR_DEC    = 4'd13,
-    CS_PREP_WR_CLR    = 4'd14;
+    DISP_IDLE     = 4'h0,
+    DISP_PRELOAD  = 4'h1,
+    DISP_READ_PT  = 4'h2,
+    DISP_READ_KEY = 4'h3,
+    DISP_ENC      = 4'h4,
+    DISP_WRITE_CT = 4'h5,
+    DISP_READ_CT  = 4'h6,
+    DISP_DEC      = 4'h7,
+    DISP_WRITE_DC = 4'h8,
+    DISP_PASS     = 4'h9,
+    DISP_FAIL     = 4'hA,
+    DISP_ERROR    = 4'hE;
+
+reg preload_done = 1'b0;
+reg ct_write_done = 1'b0;
+reg dec_write_done = 1'b0;
+reg verify_pass = 1'b0;
+reg op_done = 1'b0;
+reg op_error = 1'b0;
+reg ct_match = 1'b0;
+reg dec_match = 1'b0;
+
+localparam [4:0]
+    ST_WAIT_INIT        = 5'd0,
+    ST_PRELOAD_PT       = 5'd1,
+    ST_PRELOAD_PT_WAIT  = 5'd2,
+    ST_PRELOAD_KEY      = 5'd3,
+    ST_PRELOAD_KEY_WAIT = 5'd4,
+    ST_PRELOAD_EXP      = 5'd5,
+    ST_PRELOAD_EXP_WAIT = 5'd6,
+    ST_IDLE_READY       = 5'd7,
+    ST_READ_PT          = 5'd8,
+    ST_READ_PT_WAIT     = 5'd9,
+    ST_READ_KEY         = 5'd10,
+    ST_READ_KEY_WAIT    = 5'd11,
+    ST_ENC_START        = 5'd12,
+    ST_ENC_WAIT_CLR     = 5'd13,
+    ST_ENC_WAIT_DONE    = 5'd14,
+    ST_WRITE_CT         = 5'd15,
+    ST_WRITE_CT_WAIT    = 5'd16,
+    ST_READ_CT          = 5'd17,
+    ST_READ_CT_WAIT     = 5'd18,
+    ST_DEC_START        = 5'd19,
+    ST_DEC_WAIT_CLR     = 5'd20,
+    ST_DEC_WAIT_DONE    = 5'd21,
+    ST_WRITE_DEC        = 5'd22,
+    ST_WRITE_DEC_WAIT   = 5'd23,
+    ST_DONE             = 5'd24,
+    ST_ERROR            = 5'd25;
+
+reg [4:0] ctrl_state = ST_WAIT_INIT;
+
+wire local_busy =
+    (ctrl_state != ST_WAIT_INIT) &&
+    (ctrl_state != ST_IDLE_READY) &&
+    (ctrl_state != ST_DONE) &&
+    (ctrl_state != ST_ERROR);
+
+wire error_flag = init_err | op_error;
 
 always @(posedge CLK100MHZ) begin
     rd_start      <= 1'b0;
@@ -191,163 +267,209 @@ always @(posedge CLK100MHZ) begin
     aes_dec_start <= 1'b0;
 
     if (rst) begin
-        ctrl_state      <= CS_IDLE;
-        sd_addr         <= 32'd20;
-        op_addr         <= 32'd20;
-        plain_block     <= 128'd0;
-        enc_block       <= 128'd0;
+        ctrl_state      <= ST_WAIT_INIT;
+        sd_addr         <= DATA_BASE_ADDR;
+        rd_target       <= RT_NONE;
+        rd_capture_idx  <= 5'd0;
+        wr_source       <= WS_ROM_PT;
+        pt_block        <= 128'd0;
+        key_block       <= 128'd0;
+        ct_block        <= 128'd0;
+        ct_read_block   <= 128'd0;
         dec_block       <= 128'd0;
-        dec_input_block <= 128'd0;
-        disp_digit      <= 4'd0;
+        disp_digit      <= DISP_IDLE;
         show_digit      <= 1'b0;
-        write_led       <= 1'b0;
-        enc_led         <= 1'b0;
-        dec_led         <= 1'b0;
-        clr_led         <= 1'b0;
+        preload_done    <= 1'b0;
+        ct_write_done   <= 1'b0;
+        dec_write_done  <= 1'b0;
+        verify_pass     <= 1'b0;
+        op_done         <= 1'b0;
+        op_error        <= 1'b0;
+        ct_match        <= 1'b0;
+        dec_match       <= 1'b0;
     end else begin
-        case (ctrl_state)
-            CS_IDLE: begin
-                if (init_done && !busy) begin
-                    if (btn_wr_pulse) begin
-                        write_led   <= 1'b0;
-                        enc_led     <= 1'b0;
-                        dec_led     <= 1'b0;
-                        clr_led     <= 1'b0;
+        if (rd_valid && (rd_capture_idx < 5'd16)) begin
+            case (rd_target)
+                RT_PT:  pt_block[rd_capture_idx*8 +: 8]      <= rd_data;
+                RT_KEY: key_block[rd_capture_idx*8 +: 8]     <= rd_data;
+                RT_CT:  ct_read_block[rd_capture_idx*8 +: 8] <= rd_data;
+                default: begin end
+            endcase
+            rd_capture_idx <= rd_capture_idx + 1'b1;
+        end
 
-                        // New plain write resets encrypted/decrypted fields.
-                        plain_block <= {120'd0, input_ascii};
-                        enc_block   <= 128'd0;
-                        dec_block   <= 128'd0;
-
-                        op_addr     <= input_addr;
-                        ctrl_state  <= CS_PREP_WR_PLAIN;
-                    end else if (btn_enc_pulse) begin
-                        write_led      <= 1'b0;
-                        enc_led        <= 1'b0;
-                        dec_led        <= 1'b0;
-                        clr_led        <= 1'b0;
-
-                        op_addr        <= input_addr;
-                        ctrl_state     <= CS_ENC_START;
-                    end else if (btn_dec_pulse) begin
-                        write_led      <= 1'b0;
-                        enc_led        <= 1'b0;
-                        dec_led        <= 1'b0;
-                        clr_led        <= 1'b0;
-
-                        dec_input_block <= enc_block;
-                        op_addr         <= input_addr;
-                        ctrl_state      <= CS_DEC_START;
-                    end else if (btn_clr_pulse) begin
-                        write_led   <= 1'b0;
-                        enc_led     <= 1'b0;
-                        dec_led     <= 1'b0;
-                        clr_led     <= 1'b0;
-
-                        plain_block <= 128'd0;
-                        enc_block   <= 128'd0;
-                        dec_block   <= 128'd0;
-
-                        op_addr     <= input_addr;
-                        ctrl_state  <= CS_PREP_WR_CLR;
+        if (init_err) begin
+            ctrl_state <= ST_ERROR;
+            op_error   <= 1'b1;
+            disp_digit <= DISP_ERROR;
+            show_digit <= 1'b1;
+        end else begin
+            case (ctrl_state)
+                ST_WAIT_INIT: begin
+                    disp_digit <= DISP_IDLE;
+                    show_digit <= 1'b0;
+                    if (init_done && !busy) begin
+                        wr_source   <= WS_ROM_PT;
+                        sd_addr     <= PT_SECTOR;
+                        wr_start    <= 1'b1;
+                        disp_digit  <= DISP_PRELOAD;
+                        show_digit  <= 1'b1;
+                        ctrl_state  <= ST_PRELOAD_PT_WAIT;
                     end
                 end
-            end
 
-            CS_PREP_WR_PLAIN: begin
-                sd_addr    <= op_addr;
-                wr_start   <= 1'b1;
-                ctrl_state <= CS_WAIT_WR_PLAIN;
-            end
+                ST_PRELOAD_PT_WAIT: begin
+                    if (wr_done) begin
+                        wr_source  <= WS_ROM_KEY;
+                        sd_addr    <= KEY_SECTOR;
+                        wr_start   <= 1'b1;
+                        ctrl_state <= ST_PRELOAD_KEY_WAIT;
+                    end
+                end
 
-            CS_WAIT_WR_PLAIN: begin
-                if (wr_done) begin
-                    write_led  <= 1'b1;
-                    disp_digit <= plain_block[3:0];
+                ST_PRELOAD_KEY_WAIT: begin
+                    if (wr_done) begin
+                        wr_source  <= WS_ROM_EXP;
+                        sd_addr    <= EXP_SECTOR;
+                        wr_start   <= 1'b1;
+                        ctrl_state <= ST_PRELOAD_EXP_WAIT;
+                    end
+                end
+
+                ST_PRELOAD_EXP_WAIT: begin
+                    if (wr_done) begin
+                        preload_done <= 1'b1;
+                        disp_digit   <= DISP_IDLE;
+                        ctrl_state   <= ST_IDLE_READY;
+                    end
+                end
+
+                ST_IDLE_READY: begin
                     show_digit <= 1'b1;
-                    ctrl_state <= CS_IDLE;
+                    disp_digit <= op_done ? (verify_pass ? DISP_PASS : DISP_FAIL) : DISP_IDLE;
+                    if (btn_start_pulse && !busy) begin
+                        ct_write_done  <= 1'b0;
+                        dec_write_done <= 1'b0;
+                        verify_pass    <= 1'b0;
+                        op_done        <= 1'b0;
+                        op_error       <= 1'b0;
+                        ct_match       <= 1'b0;
+                        dec_match      <= 1'b0;
+                        pt_block       <= 128'd0;
+                        key_block      <= 128'd0;
+                        ct_block       <= 128'd0;
+                        ct_read_block  <= 128'd0;
+                        dec_block      <= 128'd0;
+                        rd_target      <= RT_PT;
+                        rd_capture_idx <= 5'd0;
+                        sd_addr        <= PT_SECTOR;
+                        rd_start       <= 1'b1;
+                        disp_digit     <= DISP_READ_PT;
+                        ctrl_state     <= ST_READ_PT_WAIT;
+                    end
                 end
-            end
 
-            CS_ENC_START: begin
-                aes_enc_start <= 1'b1;
-                ctrl_state    <= CS_ENC_WAIT_CLR;
-            end
-
-            CS_ENC_WAIT_CLR: begin
-                if (!aes_enc_done) ctrl_state <= CS_ENC_WAIT_DONE;
-            end
-
-            CS_ENC_WAIT_DONE: begin
-                if (aes_enc_done) begin
-                    enc_block  <= aes_enc_out;
-                    ctrl_state <= CS_PREP_WR_ENC;
+                ST_READ_PT_WAIT: begin
+                    if (rd_done) begin
+                        rd_target      <= RT_KEY;
+                        rd_capture_idx <= 5'd0;
+                        sd_addr        <= KEY_SECTOR;
+                        rd_start       <= 1'b1;
+                        disp_digit     <= DISP_READ_KEY;
+                        ctrl_state     <= ST_READ_KEY_WAIT;
+                    end
                 end
-            end
 
-            CS_PREP_WR_ENC: begin
-                sd_addr    <= op_addr;
-                wr_start   <= 1'b1;
-                ctrl_state <= CS_WAIT_WR_ENC;
-            end
+                ST_READ_KEY_WAIT: begin
+                    if (rd_done) begin
+                        aes_enc_start <= 1'b1;
+                        disp_digit    <= DISP_ENC;
+                        ctrl_state    <= ST_ENC_WAIT_CLR;
+                    end
+                end
 
-            CS_WAIT_WR_ENC: begin
-                if (wr_done) begin
-                    enc_led    <= 1'b1;
-                    disp_digit <= aes_enc_out[3:0];
+                ST_ENC_WAIT_CLR: begin
+                    if (!aes_enc_done) begin
+                        ctrl_state <= ST_ENC_WAIT_DONE;
+                    end
+                end
+
+                ST_ENC_WAIT_DONE: begin
+                    if (aes_enc_done) begin
+                        ct_block    <= aes_enc_out;
+                        wr_source   <= WS_CT;
+                        sd_addr     <= CT_SECTOR;
+                        wr_start    <= 1'b1;
+                        disp_digit  <= DISP_WRITE_CT;
+                        ctrl_state  <= ST_WRITE_CT_WAIT;
+                    end
+                end
+
+                ST_WRITE_CT_WAIT: begin
+                    if (wr_done) begin
+                        ct_write_done <= 1'b1;
+                        ct_read_block <= 128'd0;
+                        rd_target     <= RT_CT;
+                        rd_capture_idx<= 5'd0;
+                        sd_addr       <= CT_SECTOR;
+                        rd_start      <= 1'b1;
+                        disp_digit    <= DISP_READ_CT;
+                        ctrl_state    <= ST_READ_CT_WAIT;
+                    end
+                end
+
+                ST_READ_CT_WAIT: begin
+                    if (rd_done) begin
+                        ct_match      <= (ct_read_block == ROM_EXP_BLOCK);
+                        aes_dec_start <= 1'b1;
+                        disp_digit    <= DISP_DEC;
+                        ctrl_state    <= ST_DEC_WAIT_CLR;
+                    end
+                end
+
+                ST_DEC_WAIT_CLR: begin
+                    if (!aes_dec_done) begin
+                        ctrl_state <= ST_DEC_WAIT_DONE;
+                    end
+                end
+
+                ST_DEC_WAIT_DONE: begin
+                    if (aes_dec_done) begin
+                        dec_block   <= aes_dec_out;
+                        dec_match   <= (aes_dec_out == pt_block);
+                        wr_source   <= WS_DEC;
+                        sd_addr     <= DEC_SECTOR;
+                        wr_start    <= 1'b1;
+                        disp_digit  <= DISP_WRITE_DC;
+                        ctrl_state  <= ST_WRITE_DEC_WAIT;
+                    end
+                end
+
+                ST_WRITE_DEC_WAIT: begin
+                    if (wr_done) begin
+                        dec_write_done <= 1'b1;
+                        verify_pass    <= ct_match && dec_match;
+                        op_done        <= 1'b1;
+                        disp_digit     <= (ct_match && dec_match) ? DISP_PASS : DISP_FAIL;
+                        ctrl_state     <= ST_DONE;
+                    end
+                end
+
+                ST_DONE: begin
+                    ctrl_state <= ST_IDLE_READY;
+                end
+
+                ST_ERROR: begin
                     show_digit <= 1'b1;
-                    ctrl_state <= CS_IDLE;
+                    disp_digit <= DISP_ERROR;
                 end
-            end
 
-            CS_DEC_START: begin
-                aes_dec_start <= 1'b1;
-                ctrl_state    <= CS_DEC_WAIT_CLR;
-            end
-
-            CS_DEC_WAIT_CLR: begin
-                if (!aes_dec_done) ctrl_state <= CS_DEC_WAIT_DONE;
-            end
-
-            CS_DEC_WAIT_DONE: begin
-                if (aes_dec_done) begin
-                    dec_block  <= aes_dec_out;
-                    ctrl_state <= CS_PREP_WR_DEC;
+                default: begin
+                    ctrl_state <= ST_ERROR;
+                    op_error   <= 1'b1;
                 end
-            end
-
-            CS_PREP_WR_DEC: begin
-                sd_addr    <= op_addr;
-                wr_start   <= 1'b1;
-                ctrl_state <= CS_WAIT_WR_DEC;
-            end
-
-            CS_WAIT_WR_DEC: begin
-                if (wr_done) begin
-                    dec_led    <= 1'b1;
-                    disp_digit <= aes_dec_out[3:0];
-                    show_digit <= 1'b1;
-                    ctrl_state <= CS_IDLE;
-                end
-            end
-
-            CS_PREP_WR_CLR: begin
-                sd_addr    <= op_addr;
-                wr_start   <= 1'b1;
-                ctrl_state <= CS_WAIT_WR_CLR;
-            end
-
-            CS_WAIT_WR_CLR: begin
-                if (wr_done) begin
-                    clr_led    <= 1'b1;
-                    disp_digit <= 4'd0;
-                    show_digit <= 1'b1;
-                    ctrl_state <= CS_IDLE;
-                end
-            end
-
-            default: ctrl_state <= CS_IDLE;
-        endcase
+            endcase
+        end
     end
 end
 
@@ -388,7 +510,7 @@ seven_seg seg_disp (
     .digit     (disp_digit),
     .show_digit(show_digit),
     .init_ok   (init_done),
-    .error_flag(init_err),
+    .error_flag(error_flag),
     .an        (AN),
     .seg       (SEG)
 );
@@ -397,21 +519,18 @@ seven_seg seg_disp (
 // LEDs
 // ------------------------------------------------------------------
 assign LED[0]      = init_done;
-assign LED[1]      = write_led;
-assign LED[2]      = enc_led;
-assign LED[3]      = dec_led;
-assign LED[4]      = clr_led;
-assign LED[5]      = 1'b0;
-assign LED[6]      = busy;
+assign LED[1]      = preload_done;
+assign LED[2]      = ct_write_done;
+assign LED[3]      = dec_write_done;
+assign LED[4]      = verify_pass;
+assign LED[5]      = ct_match;
+assign LED[6]      = busy | local_busy;
 assign LED[9:7]    = 3'b000;
 assign LED[14:10]  = debug_last;
-assign LED[15]     = init_err;
+assign LED[15]     = error_flag;
 
-// Keep otherwise-unused ports tied to avoid warnings.
-wire _unused_sw0 = SW0;
-wire _unused_cd  = SD_CD;
-wire _unused_btn_levels = btn_wr_level ^ btn_enc_level ^ btn_dec_level ^ btn_clr_level ^ btn_rst_pulse;
-wire _unused_rd = rd_valid ^ rd_done ^ rd_data[0];
+// Keep otherwise-unused signals tied to avoid warnings.
+wire _unused_btn_levels = btn_start_level ^ btn_rst_pulse;
 wire [4:0] _unused_debug_state = debug_state;
 
 endmodule

@@ -1,58 +1,68 @@
-SD Reader/Writer + AES (Single-Sector Demo Flow)
-================================================
+SD Reader/Writer + AES (Autonomous SD Pipeline)
+==============================================
 
-Final demo flow
----------------
-All 3 results are kept in ONE selected sector.
+Flow
+----
+After SD initialization, the FPGA preloads fixed test vectors from `aes_vectors.hex`
+into the DATA.BIN area:
 
-Buttons:
-- BTNC: write plain digit from SW4_1
-- BTNU: encrypt current plain block
-- BTNR: decrypt current encrypted block
-- BTNL: clear payload
-- BTND: reset
+- sector 20: plaintext
+- sector 21: AES key
+- sector 22: expected ciphertext
+- sector 23: ciphertext result
+- sector 24: decrypted result
 
-Switches:
-- SW15_5: choose sector index (0..2047)
-- SW4_1: digit nibble
-- SW0: unused
+Buttons
+-------
+- BTNC: start one full operation
+- BTND: reset FPGA and rerun preload
+- BTNU / BTNR / BTNL: unused
 
-Sector layout (same selected sector)
-------------------------------------
-- bytes 0..15   : plain
-- bytes 16..31  : encrypted
-- bytes 32..47  : decrypted
-- bytes 48..511 : 00
+Operation
+---------
+When BTNC is pressed, the controller:
 
-Seven segment
--------------
-- After BTNC: shows plain nibble
-- After BTNU: shows encrypted nibble
-- After BTNR: shows decrypted nibble
+1. reads plaintext from sector 20
+2. reads AES key from sector 21
+3. encrypts plaintext
+4. writes ciphertext to sector 23
+5. reads ciphertext back from sector 23
+6. decrypts ciphertext
+7. writes decrypted data to sector 24
 
-LED mapping
------------
-- LED[1] write done
-- LED[2] encrypt done
-- LED[3] decrypt done
-- LED[4] clear done
-- LED[6] busy
+Verification
+------------
+- LED[0] = SD init done
+- LED[1] = preload done
+- LED[2] = ciphertext written
+- LED[3] = decrypted block written
+- LED[4] = decrypted block matches plaintext
+- LED[5] = ciphertext matches expected vector
+- LED[6] = controller busy
+- LED[15] = error
 
-FPGA demonstration (exact)
---------------------------
-1) Rebuild bitstream and reprogram FPGA.
-2) Set SW15_5=0, set SW4_1=3, press BTNC.
-3) Keep SW15_5=0, press BTNU.
-4) Keep SW15_5=0, press BTNR.
-5) After each press, wait for LED[6] busy to turn OFF.
+7-segment display shows stage/status codes:
+
+- `0`: idle
+- `1`: preload
+- `2`: read plaintext
+- `3`: read key
+- `4`: encrypt
+- `5`: write ciphertext
+- `6`: read ciphertext
+- `7`: decrypt
+- `8`: write decrypted
+- `9`: pass
+- `A`: fail
+- `E`: error
 
 PC verification
 ---------------
 Run as Administrator:
 
-python verify_sd.py \\.\PhysicalDrive1 0
+python verify_sd.py \\.\PhysicalDrive1
 
-Check:
-- Plain [0..15]
-- Enc [16..31]
-- Dec [32..47]
+The script reads sectors 20..24 and checks:
+
+- ciphertext sector matches expected ciphertext sector
+- decrypted sector matches plaintext sector
