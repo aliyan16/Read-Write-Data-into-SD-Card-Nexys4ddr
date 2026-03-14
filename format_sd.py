@@ -1,4 +1,4 @@
-"""
+r"""
 format_sd.py  --  Write a minimal FAT16 filesystem to an SD card.
 
 Creates one file: DATA.BIN (1 MB = 2048 x 512-byte blocks).
@@ -32,6 +32,20 @@ WARNING: Specify the SD card's PHYSICAL DISK, not a partition.
 import struct
 import sys
 import os
+
+
+def open_raw_device(path, mode):
+    if sys.platform == "win32" and path.startswith("\\\\.\\"):
+        flags = os.O_BINARY
+        if "+" in mode:
+            flags |= os.O_RDWR
+        elif "w" in mode:
+            flags |= os.O_WRONLY
+        else:
+            flags |= os.O_RDONLY
+        fd = os.open(path, flags)
+        return os.fdopen(fd, mode, buffering=0)
+    return open(path, mode)
 
 # ── FAT16 parameters ──────────────────────────────────────────────────────────
 SECTOR_SIZE        = 512
@@ -129,7 +143,7 @@ def write_fat16(device_path):
     print(f"  SW[15:5] = 2047 -> sector {DATA_START_SECTOR+2047} = DATA.BIN byte offset {2047*512}")
 
     try:
-        with open(device_path, 'r+b') as f:
+        with open_raw_device(device_path, 'r+b') as f:
             # Boot sector
             f.seek(0 * SECTOR_SIZE)
             f.write(boot)
@@ -165,6 +179,11 @@ def write_fat16(device_path):
         print(f"\nERROR: Device '{device_path}' not found.")
         print("  Windows example: \\\\.\\PhysicalDrive2")
         print("  Linux example:   /dev/sdb")
+        sys.exit(1)
+    except OSError as exc:
+        print(f"\nERROR: Raw device access failed: {exc}")
+        if sys.platform == 'win32':
+            print("  Close Explorer/HxD windows using the card and run PowerShell as Administrator.")
         sys.exit(1)
 
 
