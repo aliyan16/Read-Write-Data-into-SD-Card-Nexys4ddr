@@ -30,6 +30,7 @@ module sd_spi_controller (
     input  wire        wr_start,
     input  wire [31:0] wr_addr,
     input  wire [7:0]  wr_data,
+    output wire [8:0]  wr_byte_idx,
     output reg         wr_done,
 
     output reg         busy,
@@ -142,6 +143,7 @@ reg [31:0] delay_cnt  = 0;
 reg [2:0]  cmd_idx    = 0;
 reg [7:0]  cmd_buf    [0:5];
 reg [9:0]  byte_cnt   = 0;
+assign wr_byte_idx = byte_cnt[8:0];
 reg [15:0] retry      = 0;
 reg [15:0] poll_cnt   = 0;
 reg        token_sent = 0;
@@ -555,14 +557,20 @@ always @(posedge clk) begin
 
         ST_WR_DATA: begin
             if (!spi_busy && !spi_req) begin
-                spi_tx  = wr_data;
-                spi_req <= 1;
+                // Important: advance byte counter only after the previous byte
+                // has fully completed, then start the next transfer on the
+                // following cycle. This avoids repeating byte 0 and shifting
+                // the whole 512-byte payload by one byte.
                 if (spi_done) begin
-                    byte_cnt <= byte_cnt + 1;
                     if (byte_cnt == 511) begin
                         byte_cnt <= 0;
                         state    <= ST_WR_CRC;
+                    end else begin
+                        byte_cnt <= byte_cnt + 1;
                     end
+                end else begin
+                    spi_tx  = wr_data;
+                    spi_req <= 1;
                 end
             end
         end
